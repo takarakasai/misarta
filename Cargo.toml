@@ -1,0 +1,14 @@
+[package]
+name = "misarta"
+version = "0.1.0"
+edition = "2024"
+description = "Rigid body kinematics and dynamics for articulated robots"
+
+# misa (Misato) + art (Articulation) + ta (Takara)
+
+[dependencies]
+nalgebra = "0.34.2"
+
+[dev-dependencies]
+num-dual = "0.10"
+approx = "0.5"
