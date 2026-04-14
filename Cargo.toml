@@ -8,6 +8,7 @@ description = "Rigid body kinematics and dynamics for articulated robots"
 
 [dependencies]
 nalgebra = "0.34.2"
+roxmltree = "0.20"
 
 [dev-dependencies]
 num-dual = "0.10"

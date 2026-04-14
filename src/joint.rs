@@ -26,6 +26,26 @@ pub enum JointType<T: RealField> {
 }
 
 impl<T: RealField> JointType<T> {
+    /// Check if two joint types are approximately equal.
+    ///
+    /// Compares the variant discriminant and, for axis-bearing joints,
+    /// checks that axes are within `epsilon` of each other.
+    pub fn approx_eq(&self, other: &JointType<T>, epsilon: T) -> bool {
+        match (self, other) {
+            (
+                JointType::Revolute { axis: a },
+                JointType::Revolute { axis: b },
+            )
+            | (
+                JointType::Prismatic { axis: a },
+                JointType::Prismatic { axis: b },
+            ) => (a - b).norm() <= epsilon,
+            (JointType::Fixed, JointType::Fixed) => true,
+            (JointType::FreeFlyer, JointType::FreeFlyer) => true,
+            _ => false,
+        }
+    }
+
     /// Number of degrees of freedom for this joint type.
     pub fn nq(&self) -> usize {
         match self {
