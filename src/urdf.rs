@@ -18,6 +18,7 @@
 //! let model = urdf::load_urdf_string(&xml).unwrap();
 //! ```
 
+use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
 use crate::joint::JointType;
 use crate::model::{LinkInertia, Model, ModelBuilder};
 use crate::se3;
@@ -56,6 +57,99 @@ pub fn load_urdf(path: &std::path::Path) -> Result<Model<f64>, UrdfError> {
     let xml = std::fs::read_to_string(path)
         .map_err(|e| UrdfError::XmlParse(format!("cannot read {}: {e}", path.display())))?;
     load_urdf_string(&xml)
+}
+
+/// Load a `Model<f64>` together with visual and collision `GeometryModel`s
+/// from a URDF XML file on disk.
+pub fn load_urdf_geometry(
+    path: &std::path::Path,
+) -> Result<(Model<f64>, GeometryModel, GeometryModel), UrdfError> {
+    let xml = std::fs::read_to_string(path)
+        .map_err(|e| UrdfError::XmlParse(format!("cannot read {}: {e}", path.display())))?;
+    load_urdf_geometry_string(&xml)
+}
+
+/// Load a `Model<f64>` together with visual and collision `GeometryModel`s
+/// from a URDF XML string.
+pub fn load_urdf_geometry_string(
+    xml: &str,
+) -> Result<(Model<f64>, GeometryModel, GeometryModel), UrdfError> {
+    let doc = Document::parse(xml).map_err(|e| UrdfError::XmlParse(e.to_string()))?;
+    let robot = doc.root_element();
+    if robot.tag_name().name() != "robot" {
+        return Err(UrdfError::MissingElement("root <robot> element".into()));
+    }
+
+    // Build kinematic model via the existing parser (re-parse is cheap)
+    let model = load_urdf_string(xml)?;
+
+    // Build link_name → joint index map from the model
+    let mut link_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, name) in model.link_names.iter().enumerate() {
+        link_to_idx.insert(name.as_str(), i);
+    }
+
+    let mut visual_model = GeometryModel::new();
+    let mut collision_model = GeometryModel::new();
+
+    for link_el in robot.children().filter(|n| n.tag_name().name() == "link") {
+        let link_name = link_el
+            .attribute("name")
+            .ok_or_else(|| UrdfError::MissingElement("link name".into()))?;
+        let joint_idx = *link_to_idx
+            .get(link_name)
+            .ok_or_else(|| UrdfError::Topology(format!("link '{link_name}' not in model")))?;
+
+        // Visual geometries
+        for (vi, vis_el) in link_el
+            .children()
+            .filter(|n| n.tag_name().name() == "visual")
+            .enumerate()
+        {
+            let placement = parse_origin_element(&vis_el);
+            if let Some(shape) = parse_urdf_geometry(&vis_el) {
+                let obj_name = vis_el
+                    .attribute("name")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{link_name}_visual_{vi}"));
+                let (mesh_path, mesh_scale) = extract_mesh_info(&shape);
+                visual_model.add(GeometryObject {
+                    name: obj_name,
+                    parent_joint: joint_idx,
+                    placement,
+                    shape,
+                    mesh_path,
+                    mesh_scale,
+                });
+            }
+        }
+
+        // Collision geometries
+        for (ci, col_el) in link_el
+            .children()
+            .filter(|n| n.tag_name().name() == "collision")
+            .enumerate()
+        {
+            let placement = parse_origin_element(&col_el);
+            if let Some(shape) = parse_urdf_geometry(&col_el) {
+                let obj_name = col_el
+                    .attribute("name")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("{link_name}_collision_{ci}"));
+                let (mesh_path, mesh_scale) = extract_mesh_info(&shape);
+                collision_model.add(GeometryObject {
+                    name: obj_name,
+                    parent_joint: joint_idx,
+                    placement,
+                    shape,
+                    mesh_path,
+                    mesh_scale,
+                });
+            }
+        }
+    }
+
+    Ok((model, visual_model, collision_model))
 }
 
 /// Load a `Model<f64>` from a URDF XML string.
@@ -262,6 +356,76 @@ fn parse_vec3(s: &str) -> Vector3<f64> {
     }
 }
 
+/// Parse a URDF `<geometry>` child element into a `GeometryShape`.
+fn parse_urdf_geometry(parent: &roxmltree::Node) -> Option<GeometryShape> {
+    let geom_el = parent.children().find(|n| n.tag_name().name() == "geometry")?;
+
+    for child in geom_el.children() {
+        match child.tag_name().name() {
+            "box" => {
+                let size = parse_vec3(child.attribute("size").unwrap_or("0 0 0"));
+                return Some(GeometryShape::Box {
+                    x: size[0],
+                    y: size[1],
+                    z: size[2],
+                });
+            }
+            "sphere" => {
+                let r = child
+                    .attribute("radius")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                return Some(GeometryShape::Sphere { radius: r });
+            }
+            "cylinder" => {
+                let r = child
+                    .attribute("radius")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let l = child
+                    .attribute("length")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                return Some(GeometryShape::Cylinder { radius: r, length: l });
+            }
+            "capsule" => {
+                let r = child
+                    .attribute("radius")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let l = child
+                    .attribute("length")
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                return Some(GeometryShape::Capsule { radius: r, length: l });
+            }
+            "mesh" => {
+                let filename = child
+                    .attribute("filename")
+                    .unwrap_or("")
+                    .to_string();
+                let scale = child
+                    .attribute("scale")
+                    .map(|s| parse_vec3(s))
+                    .unwrap_or_else(|| Vector3::new(1.0, 1.0, 1.0));
+                return Some(GeometryShape::Mesh { filename, scale });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract mesh_path / mesh_scale from a shape (convenience for GeometryObject).
+fn extract_mesh_info(shape: &GeometryShape) -> (Option<String>, Option<Vector3<f64>>) {
+    match shape {
+        GeometryShape::Mesh { filename, scale } => {
+            (Some(filename.clone()), Some(scale.clone()))
+        }
+        _ => (None, None),
+    }
+}
+
 // ─── Writer ─────────────────────────────────────────────────────────────────
 
 /// Write a `Model<f64>` to a URDF XML file on disk.
@@ -273,6 +437,15 @@ pub fn write_urdf(model: &Model<f64>, path: &std::path::Path) -> Result<(), Urdf
 
 /// Serialize a `Model<f64>` to a URDF XML string.
 pub fn write_urdf_string(model: &Model<f64>) -> String {
+    write_urdf_geometry_string(model, None, None)
+}
+
+/// Serialize a `Model<f64>` with optional visual/collision geometry to a URDF XML string.
+pub fn write_urdf_geometry_string(
+    model: &Model<f64>,
+    visual: Option<&GeometryModel>,
+    collision: Option<&GeometryModel>,
+) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\"?>\n");
     out.push_str(&format!("<robot name=\"{}\">\n", xml_escape(&model.name)));
@@ -296,6 +469,25 @@ pub fn write_urdf_string(model: &Model<f64>) -> String {
             ));
             out.push_str("    </inertial>\n");
         }
+
+        // Visual geometries for this link
+        if let Some(vis) = visual {
+            for obj in &vis.objects {
+                if obj.parent_joint == i {
+                    write_urdf_visual_or_collision(&mut out, obj, "visual");
+                }
+            }
+        }
+
+        // Collision geometries for this link
+        if let Some(col) = collision {
+            for obj in &col.objects {
+                if obj.parent_joint == i {
+                    write_urdf_visual_or_collision(&mut out, obj, "collision");
+                }
+            }
+        }
+
         out.push_str("  </link>\n");
     }
 
@@ -350,6 +542,59 @@ pub fn write_urdf_string(model: &Model<f64>) -> String {
 
     out.push_str("</robot>\n");
     out
+}
+
+/// Write a `<visual>` or `<collision>` element for a geometry object.
+fn write_urdf_visual_or_collision(out: &mut String, obj: &GeometryObject, tag: &str) {
+    out.push_str(&format!("    <{tag}>\n"));
+
+    // origin
+    let t = se3::translation(&obj.placement);
+    let rot = se3::rotation_matrix(&obj.placement);
+    let rotation = Rotation3::from_matrix_unchecked(rot);
+    let (r, p, y) = rotation.euler_angles();
+    out.push_str(&format!(
+        "      <origin xyz=\"{} {} {}\" rpy=\"{} {} {}\"/>\n",
+        t[0], t[1], t[2], r, p, y,
+    ));
+
+    // geometry
+    out.push_str("      <geometry>\n");
+    match &obj.shape {
+        GeometryShape::Box { x, y, z } => {
+            out.push_str(&format!("        <box size=\"{x} {y} {z}\"/>\n"));
+        }
+        GeometryShape::Sphere { radius } => {
+            out.push_str(&format!("        <sphere radius=\"{radius}\"/>\n"));
+        }
+        GeometryShape::Cylinder { radius, length } => {
+            out.push_str(&format!(
+                "        <cylinder radius=\"{radius}\" length=\"{length}\"/>\n"
+            ));
+        }
+        GeometryShape::Capsule { radius, length } => {
+            out.push_str(&format!(
+                "        <capsule radius=\"{radius}\" length=\"{length}\"/>\n"
+            ));
+        }
+        GeometryShape::Cone { radius, length } => {
+            // URDF does not natively support cone; write as a comment + cylinder fallback
+            out.push_str(&format!(
+                "        <!-- cone not standard in URDF -->\n        <cylinder radius=\"{radius}\" length=\"{length}\"/>\n"
+            ));
+        }
+        GeometryShape::Mesh { filename, scale } => {
+            out.push_str(&format!(
+                "        <mesh filename=\"{}\" scale=\"{} {} {}\"/>\n",
+                xml_escape(filename),
+                scale[0],
+                scale[1],
+                scale[2],
+            ));
+        }
+    }
+    out.push_str("      </geometry>\n");
+    out.push_str(&format!("    </{tag}>\n"));
 }
 
 /// Minimal XML escaping for attribute values.
@@ -577,5 +822,116 @@ mod tests {
         assert!(xml.contains("name=\"base_link\""));
         assert!(xml.contains("name=\"link1\""));
         assert!(xml.contains("name=\"link2\""));
+    }
+
+    const URDF_WITH_GEOMETRY: &str = r#"<?xml version="1.0"?>
+<robot name="geom_test">
+  <link name="base">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.2 0.3 0.1"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.2 0.3 0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="child">
+    <visual>
+      <origin xyz="0 0 0.1" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.02" length="0.2"/>
+      </geometry>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0.2" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.03"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="j1" type="revolute">
+    <parent link="base"/>
+    <child link="child"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+</robot>"#;
+
+    #[test]
+    fn urdf_parse_geometry() {
+        let (model, vis, col) = load_urdf_geometry_string(URDF_WITH_GEOMETRY).unwrap();
+        assert_eq!(model.num_joints(), 1);
+        assert_eq!(vis.num_objects(), 3);  // 1 box + 1 cylinder + 1 sphere
+        assert_eq!(col.num_objects(), 1);  // 1 box
+
+        // Check shapes
+        assert_eq!(
+            vis.objects[0].shape,
+            GeometryShape::Box { x: 0.2, y: 0.3, z: 0.1 }
+        );
+        assert_eq!(
+            vis.objects[1].shape,
+            GeometryShape::Cylinder { radius: 0.02, length: 0.2 }
+        );
+        assert_eq!(
+            vis.objects[2].shape,
+            GeometryShape::Sphere { radius: 0.03 }
+        );
+
+        // Check parent joints
+        assert_eq!(vis.objects[0].parent_joint, 0); // base
+        assert_eq!(vis.objects[1].parent_joint, 1); // child
+        assert_eq!(vis.objects[2].parent_joint, 1); // child
+    }
+
+    #[test]
+    fn urdf_geometry_roundtrip() {
+        let (model, vis, col) = load_urdf_geometry_string(URDF_WITH_GEOMETRY).unwrap();
+        let xml = write_urdf_geometry_string(&model, Some(&vis), Some(&col));
+        let (model2, vis2, col2) = load_urdf_geometry_string(&xml).unwrap();
+
+        assert!(model.approx_eq(&model2, 1e-12));
+        assert_eq!(vis.num_objects(), vis2.num_objects());
+        assert_eq!(col.num_objects(), col2.num_objects());
+        for (a, b) in vis.objects.iter().zip(vis2.objects.iter()) {
+            assert_eq!(a.shape, b.shape);
+            assert_eq!(a.parent_joint, b.parent_joint);
+        }
+        for (a, b) in col.objects.iter().zip(col2.objects.iter()) {
+            assert_eq!(a.shape, b.shape);
+            assert_eq!(a.parent_joint, b.parent_joint);
+        }
+    }
+
+    #[test]
+    fn urdf_mesh_geometry() {
+        let xml = r#"<?xml version="1.0"?>
+<robot name="mesh_test">
+  <link name="base">
+    <visual>
+      <geometry>
+        <mesh filename="package://robot/meshes/base.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+  </link>
+</robot>"#;
+        let (_, vis, _) = load_urdf_geometry_string(xml).unwrap();
+        assert_eq!(vis.num_objects(), 1);
+        match &vis.objects[0].shape {
+            GeometryShape::Mesh { filename, scale } => {
+                assert_eq!(filename, "package://robot/meshes/base.stl");
+                assert_relative_eq!(*scale, Vector3::new(0.001, 0.001, 0.001), epsilon = 1e-12);
+            }
+            _ => panic!("expected mesh shape"),
+        }
+        assert_eq!(
+            vis.objects[0].mesh_path.as_deref(),
+            Some("package://robot/meshes/base.stl")
+        );
     }
 }

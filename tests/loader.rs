@@ -325,3 +325,99 @@ fn sdf_to_urdf_cross_roundtrip() {
         "SDF → URDF cross-roundtrip failed",
     );
 }
+
+// ─── Geometry integration tests ─────────────────────────────────────────────
+
+use misarta::geometry::GeometryShape;
+
+#[test]
+fn urdf_fixture_load_geometry() {
+    let path = fixture_path("urdf/test_robot.urdf");
+    let (model, vis, col) = misarta::urdf::load_urdf_geometry(&path).unwrap();
+
+    assert_eq!(model.num_joints(), 3);
+    // test_robot.urdf: base_link(box), link1(cylinder), link2(sphere), fixed_part(box) = 4 visuals
+    assert_eq!(vis.num_objects(), 4);
+    // base_link(box), link1(cylinder) = 2 collisions
+    assert_eq!(col.num_objects(), 2);
+
+    // Check shape types
+    assert!(matches!(vis.objects[0].shape, GeometryShape::Box { .. }));
+    assert!(matches!(vis.objects[1].shape, GeometryShape::Cylinder { .. }));
+    assert!(matches!(vis.objects[2].shape, GeometryShape::Sphere { .. }));
+    assert!(matches!(vis.objects[3].shape, GeometryShape::Box { .. }));
+
+    // Check collision shapes
+    assert!(matches!(col.objects[0].shape, GeometryShape::Box { .. }));
+    assert!(matches!(col.objects[1].shape, GeometryShape::Cylinder { .. }));
+}
+
+#[test]
+fn sdf_fixture_load_geometry() {
+    let path = fixture_path("sdf/test_robot.sdf");
+    let (model, vis, col) = misarta::sdf::load_sdf_geometry(&path).unwrap();
+
+    assert_eq!(model.num_joints(), 3);
+    // test_robot.sdf: base_link(box), link1(cylinder), link2(sphere), fixed_part(box) = 4 visuals
+    assert_eq!(vis.num_objects(), 4);
+    // base_link(box) = 1 collision
+    assert_eq!(col.num_objects(), 1);
+
+    assert!(matches!(vis.objects[0].shape, GeometryShape::Box { .. }));
+    assert!(matches!(vis.objects[1].shape, GeometryShape::Cylinder { .. }));
+    assert!(matches!(vis.objects[2].shape, GeometryShape::Sphere { .. }));
+    assert!(matches!(vis.objects[3].shape, GeometryShape::Box { .. }));
+}
+
+#[test]
+fn urdf_fixture_geometry_roundtrip() {
+    let path = fixture_path("urdf/test_robot.urdf");
+    let (model, vis, col) = misarta::urdf::load_urdf_geometry(&path).unwrap();
+    let xml = misarta::urdf::write_urdf_geometry_string(&model, Some(&vis), Some(&col));
+    let (model2, vis2, col2) = misarta::urdf::load_urdf_geometry_string(&xml).unwrap();
+
+    assert!(model.approx_eq(&model2, 1e-12));
+    assert_eq!(vis.num_objects(), vis2.num_objects());
+    assert_eq!(col.num_objects(), col2.num_objects());
+    // Compare sorted by (parent_joint, shape debug) since XML element order may differ
+    let mut v1: Vec<_> = vis.objects.iter().map(|o| (o.parent_joint, &o.shape)).collect();
+    let mut v2: Vec<_> = vis2.objects.iter().map(|o| (o.parent_joint, &o.shape)).collect();
+    v1.sort_by_key(|x| x.0);
+    v2.sort_by_key(|x| x.0);
+    for (a, b) in v1.iter().zip(v2.iter()) {
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+    }
+}
+
+#[test]
+fn sdf_fixture_geometry_roundtrip() {
+    let path = fixture_path("sdf/test_robot.sdf");
+    let (model, vis, col) = misarta::sdf::load_sdf_geometry(&path).unwrap();
+    let xml = misarta::sdf::write_sdf_geometry_string(&model, Some(&vis), Some(&col));
+    let (model2, vis2, col2) = misarta::sdf::load_sdf_geometry_string(&xml).unwrap();
+
+    assert!(model.approx_eq(&model2, 1e-12));
+    assert_eq!(vis.num_objects(), vis2.num_objects());
+    assert_eq!(col.num_objects(), col2.num_objects());
+    let mut v1: Vec<_> = vis.objects.iter().map(|o| (o.parent_joint, &o.shape)).collect();
+    let mut v2: Vec<_> = vis2.objects.iter().map(|o| (o.parent_joint, &o.shape)).collect();
+    v1.sort_by_key(|x| x.0);
+    v2.sort_by_key(|x| x.0);
+    for (a, b) in v1.iter().zip(v2.iter()) {
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+    }
+}
+
+#[test]
+fn urdf_sdf_geometry_shapes_match() {
+    // URDF and SDF fixture describe the same robot — visual shapes should agree.
+    let (_, urdf_vis, _) = misarta::urdf::load_urdf_geometry(&fixture_path("urdf/test_robot.urdf")).unwrap();
+    let (_, sdf_vis, _) = misarta::sdf::load_sdf_geometry(&fixture_path("sdf/test_robot.sdf")).unwrap();
+
+    assert_eq!(urdf_vis.num_objects(), sdf_vis.num_objects());
+    for (u, s) in urdf_vis.objects.iter().zip(sdf_vis.objects.iter()) {
+        assert_eq!(u.shape, s.shape, "shape mismatch for {} vs {}", u.name, s.name);
+    }
+}
