@@ -60,6 +60,9 @@ pub struct Model<T: RealField> {
     pub joints: Vec<JointModel<T>>,
     /// Link inertias, indexed in parallel with `joints`.
     pub inertias: Vec<LinkInertia<T>>,
+    /// Link names, indexed in parallel with `joints`.
+    /// `link_names[0]` is the root link; `link_names[i]` is the child link of `joints[i]`.
+    pub link_names: Vec<String>,
     /// Starting index of each joint's configuration in the q vector.
     pub q_idx: Vec<usize>,
     /// Starting index of each joint's velocity in the v vector.
@@ -229,6 +232,7 @@ pub struct ModelBuilder<T: RealField> {
     name: String,
     joints: Vec<JointModel<T>>,
     inertias: Vec<LinkInertia<T>>,
+    link_names: Vec<String>,
     nq: usize,
     nv: usize,
     q_idx: Vec<usize>,
@@ -249,6 +253,7 @@ impl<T: RealField> ModelBuilder<T> {
             name: String::new(),
             joints: vec![universe],
             inertias: vec![LinkInertia::zero()],
+            link_names: vec!["base_link".to_string()],
             nq: 0,
             nv: 0,
             q_idx: vec![0],
@@ -263,6 +268,12 @@ impl<T: RealField> ModelBuilder<T> {
         self
     }
 
+    /// Set the root link name (default: `"base_link"`).
+    pub fn root_link_name(mut self, name: impl Into<String>) -> Self {
+        self.link_names[0] = name.into();
+        self
+    }
+
     /// Set the gravity vector.
     pub fn gravity(mut self, g: Vector3<T>) -> Self {
         self.gravity = g;
@@ -271,20 +282,35 @@ impl<T: RealField> ModelBuilder<T> {
 
     /// Add a joint (and its associated link) to the model.
     ///
+    /// The child link name is auto-generated as `"link_{n}"`. To specify
+    /// an explicit link name, use [`add_joint_with_link`](Self::add_joint_with_link).
+    ///
     /// - `name`: human-readable joint name
     /// - `parent`: index of the parent joint (0 = universe)
     /// - `joint_type`: the joint type
     /// - `placement`: fixed placement from the parent joint frame to this joint's reference frame
     /// - `inertia`: link inertia attached to this joint
-    ///
-    /// Returns the index of the newly added joint.
     pub fn add_joint(
+        self,
+        name: impl Into<String>,
+        parent: usize,
+        joint_type: JointType<T>,
+        placement: SE3<T>,
+        inertia: LinkInertia<T>,
+    ) -> Self {
+        let link_name = format!("link_{}", self.joints.len());
+        self.add_joint_with_link(name, parent, joint_type, placement, inertia, link_name)
+    }
+
+    /// Add a joint with an explicit child link name.
+    pub fn add_joint_with_link(
         mut self,
         name: impl Into<String>,
         parent: usize,
         joint_type: JointType<T>,
         placement: SE3<T>,
         inertia: LinkInertia<T>,
+        link_name: impl Into<String>,
     ) -> Self {
         let qi = self.nq;
         let vi = self.nv;
@@ -299,6 +325,7 @@ impl<T: RealField> ModelBuilder<T> {
             placement,
         });
         self.inertias.push(inertia);
+        self.link_names.push(link_name.into());
         self
     }
 
@@ -308,6 +335,7 @@ impl<T: RealField> ModelBuilder<T> {
             name: self.name,
             joints: self.joints,
             inertias: self.inertias,
+            link_names: self.link_names,
             q_idx: self.q_idx,
             v_idx: self.v_idx,
             nq: self.nq,

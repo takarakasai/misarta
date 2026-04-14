@@ -179,7 +179,9 @@ pub fn load_sdf_string(xml: &str) -> Result<Model<f64>, SdfError> {
 
     // ── Build model ─────────────────────────────────────────────────────
     let model_name = model_el.attribute("name").unwrap_or("").to_string();
-    let mut builder = ModelBuilder::new().name(model_name);
+    let mut builder = ModelBuilder::new()
+        .name(model_name)
+        .root_link_name(root_link.clone());
     for ji in &ordered_joints {
         let parent_idx = link_to_idx[&ji.parent_link];
         let inertia = link_inertias
@@ -192,12 +194,13 @@ pub fn load_sdf_string(xml: &str) -> Result<Model<f64>, SdfError> {
         // We use it directly as the parent→joint placement, which is correct
         // when the joint pose is expressed relative to the parent (the common case
         // for simple SDF files without nested model frames).
-        builder = builder.add_joint(
+        builder = builder.add_joint_with_link(
             ji.name.clone(),
             parent_idx,
             ji.joint_type.clone(),
             ji.pose,
             inertia,
+            ji.child_link.clone(),
         );
     }
 
@@ -290,6 +293,112 @@ fn parse_vec3(s: &str) -> Vector3<f64> {
     } else {
         Vector3::zeros()
     }
+}
+
+// ─── Writer ─────────────────────────────────────────────────────────────────
+
+/// Write a `Model<f64>` to an SDF XML file on disk.
+pub fn write_sdf(model: &Model<f64>, path: &std::path::Path) -> Result<(), SdfError> {
+    let xml = write_sdf_string(model);
+    std::fs::write(path, xml)
+        .map_err(|e| SdfError::XmlParse(format!("cannot write {}: {e}", path.display())))
+}
+
+/// Serialize a `Model<f64>` to an SDF XML string.
+pub fn write_sdf_string(model: &Model<f64>) -> String {
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\"?>\n");
+    out.push_str("<sdf version=\"1.7\">\n");
+    out.push_str(&format!(
+        "  <model name=\"{}\">\n",
+        xml_escape(&model.name)
+    ));
+
+    // ── Links ───────────────────────────────────────────────────────────
+    for (i, link_name) in model.link_names.iter().enumerate() {
+        out.push_str(&format!(
+            "    <link name=\"{}\">\n",
+            xml_escape(link_name)
+        ));
+        let inertia = &model.inertias[i];
+        if inertia.mass != 0.0
+            || inertia.center_of_mass[0] != 0.0
+            || inertia.center_of_mass[1] != 0.0
+            || inertia.center_of_mass[2] != 0.0
+        {
+            out.push_str("      <inertial>\n");
+            out.push_str(&format!(
+                "        <pose>{} {} {} 0 0 0</pose>\n",
+                inertia.center_of_mass[0],
+                inertia.center_of_mass[1],
+                inertia.center_of_mass[2],
+            ));
+            out.push_str(&format!("        <mass>{}</mass>\n", inertia.mass));
+            out.push_str("      </inertial>\n");
+        }
+        out.push_str("    </link>\n");
+    }
+
+    // ── Joints ──────────────────────────────────────────────────────────
+    for i in 1..model.joints.len() {
+        let joint = &model.joints[i];
+        let jtype_str = match &joint.joint_type {
+            JointType::Revolute { .. } => "revolute",
+            JointType::Prismatic { .. } => "prismatic",
+            JointType::Fixed => "fixed",
+            JointType::FreeFlyer => "ball",
+        };
+        out.push_str(&format!(
+            "    <joint name=\"{}\" type=\"{}\">\n",
+            xml_escape(&joint.name),
+            jtype_str,
+        ));
+
+        // parent / child
+        out.push_str(&format!(
+            "      <parent>{}</parent>\n",
+            xml_escape(&model.link_names[joint.parent]),
+        ));
+        out.push_str(&format!(
+            "      <child>{}</child>\n",
+            xml_escape(&model.link_names[i]),
+        ));
+
+        // pose
+        let t = se3::translation(&joint.placement);
+        let rot = se3::rotation_matrix(&joint.placement);
+        let rotation = Rotation3::from_matrix_unchecked(rot);
+        let (r, p, y) = rotation.euler_angles();
+        out.push_str(&format!(
+            "      <pose>{} {} {} {} {} {}</pose>\n",
+            t[0], t[1], t[2], r, p, y,
+        ));
+
+        // axis (for revolute / prismatic)
+        match &joint.joint_type {
+            JointType::Revolute { axis } | JointType::Prismatic { axis } => {
+                out.push_str(&format!(
+                    "      <axis>\n        <xyz>{} {} {}</xyz>\n      </axis>\n",
+                    axis[0], axis[1], axis[2],
+                ));
+            }
+            _ => {}
+        }
+
+        out.push_str("    </joint>\n");
+    }
+
+    out.push_str("  </model>\n");
+    out.push_str("</sdf>\n");
+    out
+}
+
+/// Minimal XML escaping for text content and attribute values.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -469,5 +578,26 @@ mod tests {
                 epsilon = 1e-12,
             );
         }
+    }
+
+    #[test]
+    fn sdf_roundtrip() {
+        // load → write → load again → models must be structurally equal
+        let model = load_sdf_string(SIMPLE_SDF).unwrap();
+        let xml = write_sdf_string(&model);
+        let model2 = load_sdf_string(&xml).unwrap();
+        assert!(model.approx_eq(&model2, 1e-12));
+    }
+
+    #[test]
+    fn sdf_write_preserves_link_names() {
+        let model = load_sdf_string(SIMPLE_SDF).unwrap();
+        assert_eq!(model.link_names[0], "base_link");
+        assert_eq!(model.link_names[1], "link1");
+        assert_eq!(model.link_names[2], "link2");
+        let xml = write_sdf_string(&model);
+        assert!(xml.contains("name=\"base_link\""));
+        assert!(xml.contains("name=\"link1\""));
+        assert!(xml.contains("name=\"link2\""));
     }
 }

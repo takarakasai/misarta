@@ -279,3 +279,49 @@ fn approx_eq_by_name_detects_mismatch() {
     assert_eq!(mismatches[0].0, "j1");
     assert!(mismatches[0].1.contains("joint_type"));
 }
+
+// ─── URDF / SDF roundtrip writer tests ──────────────────────────────────────
+
+#[test]
+fn urdf_fixture_roundtrip() {
+    // load fixture URDF → write → load again → structurally equal
+    let path = fixture_path("urdf/test_robot.urdf");
+    let m1 = misarta::urdf::load_urdf(&path).unwrap();
+    let xml = misarta::urdf::write_urdf_string(&m1);
+    let m2 = misarta::urdf::load_urdf_string(&xml).unwrap();
+    assert!(m1.approx_eq(&m2, 1e-12), "URDF roundtrip failed");
+}
+
+#[test]
+fn sdf_fixture_roundtrip() {
+    // load fixture SDF → write → load again → structurally equal
+    let path = fixture_path("sdf/test_robot.sdf");
+    let m1 = misarta::sdf::load_sdf(&path).unwrap();
+    let xml = misarta::sdf::write_sdf_string(&m1);
+    let m2 = misarta::sdf::load_sdf_string(&xml).unwrap();
+    assert!(m1.approx_eq(&m2, 1e-12), "SDF roundtrip failed");
+}
+
+#[test]
+fn urdf_to_sdf_cross_roundtrip() {
+    // load URDF → write as SDF → load SDF → compare by name
+    let urdf_model = misarta::urdf::load_urdf(&fixture_path("urdf/test_robot.urdf")).unwrap();
+    let sdf_xml = misarta::sdf::write_sdf_string(&urdf_model);
+    let sdf_model = misarta::sdf::load_sdf_string(&sdf_xml).unwrap();
+    assert!(
+        urdf_model.approx_eq(&sdf_model, 1e-10),
+        "URDF → SDF cross-roundtrip failed",
+    );
+}
+
+#[test]
+fn sdf_to_urdf_cross_roundtrip() {
+    // load SDF → write as URDF → load URDF → compare by name
+    let sdf_model = misarta::sdf::load_sdf(&fixture_path("sdf/test_robot.sdf")).unwrap();
+    let urdf_xml = misarta::urdf::write_urdf_string(&sdf_model);
+    let urdf_model = misarta::urdf::load_urdf_string(&urdf_xml).unwrap();
+    assert!(
+        sdf_model.approx_eq(&urdf_model, 1e-10),
+        "SDF → URDF cross-roundtrip failed",
+    );
+}

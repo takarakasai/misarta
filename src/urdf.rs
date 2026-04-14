@@ -172,7 +172,9 @@ pub fn load_urdf_string(xml: &str) -> Result<Model<f64>, UrdfError> {
     }
 
     let robot_name = robot.attribute("name").unwrap_or("").to_string();
-    let mut builder = ModelBuilder::new().name(robot_name);
+    let mut builder = ModelBuilder::new()
+        .name(robot_name)
+        .root_link_name(root_link.clone());
     for ji in &ordered_joints {
         let parent_idx = link_to_idx[&ji.parent_link];
         let inertia = link_inertias
@@ -180,12 +182,13 @@ pub fn load_urdf_string(xml: &str) -> Result<Model<f64>, UrdfError> {
             .cloned()
             .unwrap_or_else(LinkInertia::zero);
 
-        builder = builder.add_joint(
+        builder = builder.add_joint_with_link(
             ji.name.clone(),
             parent_idx,
             ji.joint_type.clone(),
             ji.origin,
             inertia,
+            ji.child_link.clone(),
         );
     }
 
@@ -257,6 +260,104 @@ fn parse_vec3(s: &str) -> Vector3<f64> {
     } else {
         Vector3::zeros()
     }
+}
+
+// ─── Writer ─────────────────────────────────────────────────────────────────
+
+/// Write a `Model<f64>` to a URDF XML file on disk.
+pub fn write_urdf(model: &Model<f64>, path: &std::path::Path) -> Result<(), UrdfError> {
+    let xml = write_urdf_string(model);
+    std::fs::write(path, xml)
+        .map_err(|e| UrdfError::XmlParse(format!("cannot write {}: {e}", path.display())))
+}
+
+/// Serialize a `Model<f64>` to a URDF XML string.
+pub fn write_urdf_string(model: &Model<f64>) -> String {
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\"?>\n");
+    out.push_str(&format!("<robot name=\"{}\">\n", xml_escape(&model.name)));
+
+    // ── Links ───────────────────────────────────────────────────────────
+    for (i, link_name) in model.link_names.iter().enumerate() {
+        out.push_str(&format!("  <link name=\"{}\">\n", xml_escape(link_name)));
+        let inertia = &model.inertias[i];
+        if inertia.mass != 0.0
+            || inertia.center_of_mass[0] != 0.0
+            || inertia.center_of_mass[1] != 0.0
+            || inertia.center_of_mass[2] != 0.0
+        {
+            out.push_str("    <inertial>\n");
+            out.push_str(&format!("      <mass value=\"{}\"/>\n", inertia.mass));
+            out.push_str(&format!(
+                "      <origin xyz=\"{} {} {}\"/>\n",
+                inertia.center_of_mass[0],
+                inertia.center_of_mass[1],
+                inertia.center_of_mass[2],
+            ));
+            out.push_str("    </inertial>\n");
+        }
+        out.push_str("  </link>\n");
+    }
+
+    // ── Joints ──────────────────────────────────────────────────────────
+    for i in 1..model.joints.len() {
+        let joint = &model.joints[i];
+        let jtype_str = match &joint.joint_type {
+            JointType::Revolute { .. } => "revolute",
+            JointType::Prismatic { .. } => "prismatic",
+            JointType::Fixed => "fixed",
+            JointType::FreeFlyer => "floating",
+        };
+        out.push_str(&format!(
+            "  <joint name=\"{}\" type=\"{}\">\n",
+            xml_escape(&joint.name),
+            jtype_str,
+        ));
+
+        // parent / child
+        out.push_str(&format!(
+            "    <parent link=\"{}\"/>\n",
+            xml_escape(&model.link_names[joint.parent]),
+        ));
+        out.push_str(&format!(
+            "    <child link=\"{}\"/>\n",
+            xml_escape(&model.link_names[i]),
+        ));
+
+        // origin
+        let t = se3::translation(&joint.placement);
+        let rot = se3::rotation_matrix(&joint.placement);
+        let rotation = Rotation3::from_matrix_unchecked(rot);
+        let (r, p, y) = rotation.euler_angles();
+        out.push_str(&format!(
+            "    <origin xyz=\"{} {} {}\" rpy=\"{} {} {}\"/>\n",
+            t[0], t[1], t[2], r, p, y,
+        ));
+
+        // axis (for revolute / prismatic)
+        match &joint.joint_type {
+            JointType::Revolute { axis } | JointType::Prismatic { axis } => {
+                out.push_str(&format!(
+                    "    <axis xyz=\"{} {} {}\"/>\n",
+                    axis[0], axis[1], axis[2],
+                ));
+            }
+            _ => {}
+        }
+
+        out.push_str("  </joint>\n");
+    }
+
+    out.push_str("</robot>\n");
+    out
+}
+
+/// Minimal XML escaping for attribute values.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -455,5 +556,26 @@ mod tests {
                 epsilon = 1e-12,
             );
         }
+    }
+
+    #[test]
+    fn urdf_roundtrip() {
+        // load → write → load again → models must be structurally equal
+        let model = load_urdf_string(SIMPLE_URDF).unwrap();
+        let xml = write_urdf_string(&model);
+        let model2 = load_urdf_string(&xml).unwrap();
+        assert!(model.approx_eq(&model2, 1e-12));
+    }
+
+    #[test]
+    fn urdf_write_preserves_link_names() {
+        let model = load_urdf_string(SIMPLE_URDF).unwrap();
+        assert_eq!(model.link_names[0], "base_link");
+        assert_eq!(model.link_names[1], "link1");
+        assert_eq!(model.link_names[2], "link2");
+        let xml = write_urdf_string(&model);
+        assert!(xml.contains("name=\"base_link\""));
+        assert!(xml.contains("name=\"link1\""));
+        assert!(xml.contains("name=\"link2\""));
     }
 }
