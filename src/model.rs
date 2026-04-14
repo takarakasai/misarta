@@ -223,6 +223,32 @@ impl<T: RealField> Model<T> {
         }
         q
     }
+
+    /// Collect the chain of ancestor joint indices from `joint_idx` up to
+    /// (but not including) the universe (0).
+    ///
+    /// Returns the path in **child → root** order, e.g. `[joint_idx, parent, grandparent, …]`.
+    pub fn ancestors_of(&self, joint_idx: usize) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut cur = joint_idx;
+        while cur > 0 {
+            chain.push(cur);
+            cur = self.joints[cur].parent;
+        }
+        chain
+    }
+
+    /// Check whether `ancestor` is on the path from `descendant` to the root.
+    pub fn is_ancestor(&self, ancestor: usize, descendant: usize) -> bool {
+        let mut cur = descendant;
+        while cur > 0 {
+            if cur == ancestor {
+                return true;
+            }
+            cur = self.joints[cur].parent;
+        }
+        ancestor == 0
+    }
 }
 
 // ─── Builder ────────────────────────────────────────────────────────────────

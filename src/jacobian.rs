@@ -1,4 +1,4 @@
-//! Jacobian computation — pure function mapping (model, q) → Jacobian matrix.
+//! Jacobian computation — pure functions mapping (model, q) → Jacobian matrix.
 //!
 //! Computes the geometric Jacobian of each joint frame expressed in the world frame,
 //! equivalent to `pinocchio::computeJointJacobians`.
@@ -9,6 +9,13 @@
 //! The top 3 rows are angular velocity, the bottom 3 are linear velocity
 //! (Pinocchio / Featherstone convention).
 //!
+//! # Extended API
+//!
+//! - [`compute_joint_jacobian`] — world-frame Jacobian for a single joint (root→joint)
+//! - [`compute_relative_jacobian`] — Jacobian of `ee_idx` expressed in the frame of `base_idx`
+//! - [`compute_masked_jacobian`] — like `compute_joint_jacobian` but with a joint mask
+//! - [`compute_relative_masked_jacobian`] — relative Jacobian with a joint mask
+//!
 //! Generic over `T: RealField`.
 
 use crate::data::Data;
@@ -16,6 +23,8 @@ use crate::fk::forward_kinematics;
 use crate::model::Model;
 use crate::se3;
 use nalgebra::{DMatrix, RealField, Vector3};
+
+// ─── Core: world-frame Jacobian ─────────────────────────────────────────────
 
 /// Compute the world-frame geometric Jacobian for a specific joint.
 ///
@@ -34,7 +43,7 @@ pub fn compute_joint_jacobian<T: RealField>(
     compute_joint_jacobian_from_data(model, q, &data, joint_idx)
 }
 
-/// Same as `compute_joint_jacobian` but takes pre-computed FK data.
+/// Same as [`compute_joint_jacobian`] but takes pre-computed FK data.
 ///
 /// Useful when you already have FK results and want to avoid recomputing them.
 pub fn compute_joint_jacobian_from_data<T: RealField>(
@@ -44,55 +53,207 @@ pub fn compute_joint_jacobian_from_data<T: RealField>(
     joint_idx: usize,
 ) -> DMatrix<T> {
     let mut jac = DMatrix::zeros(6, model.nv);
+    write_chain_columns(model, q, data, joint_idx, joint_idx, &mut jac);
+    jac
+}
 
-    // Walk from the target joint back to the root, accumulating columns.
-    let target_pos = se3::translation(&data.oMi[joint_idx]);
+// ─── Relative Jacobian (between any two joints) ────────────────────────────
 
-    let mut current = joint_idx;
+/// Compute the geometric Jacobian of `ee_idx` **relative to** `base_idx`.
+///
+/// Returns a 6×nv matrix equal to `J(ee) − J(base)`, where each J is the
+/// standard world-frame Jacobian. This correctly handles:
+///
+/// - **Serial chain** (base is an ancestor of ee): common-ancestor columns
+///   cancel in angular and produce a lever-arm difference in linear.
+/// - **Branched tree** (base and ee on different branches): base-only joints
+///   contribute with negated sign.
+///
+/// The result is expressed in the **world frame**.
+///
+/// ## Panics
+///
+/// Panics if `base_idx` or `ee_idx` is 0 or out of range.
+pub fn compute_relative_jacobian<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    base_idx: usize,
+    ee_idx: usize,
+) -> DMatrix<T> {
+    assert!(base_idx > 0 && base_idx < model.joints.len());
+    assert!(ee_idx > 0 && ee_idx < model.joints.len());
+
+    let data = forward_kinematics(model, q);
+    compute_relative_jacobian_from_data(model, q, &data, base_idx, ee_idx)
+}
+
+/// Same as [`compute_relative_jacobian`] but takes pre-computed FK data.
+pub fn compute_relative_jacobian_from_data<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
+    base_idx: usize,
+    ee_idx: usize,
+) -> DMatrix<T> {
+    let j_ee = compute_joint_jacobian_from_data(model, q, data, ee_idx);
+    let j_base = compute_joint_jacobian_from_data(model, q, data, base_idx);
+    j_ee - j_base
+}
+
+// ─── Masked Jacobian (exclude joints) ───────────────────────────────────────
+
+/// Compute the world-frame Jacobian for `joint_idx`, zeroing out columns
+/// for joints whose index appears in `mask` (disabled joints).
+///
+/// `mask` is a slice of **joint indices** (1-based) that should be locked /
+/// excluded from the Jacobian. Their columns will be zero.
+pub fn compute_masked_jacobian<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    joint_idx: usize,
+    mask: &[usize],
+) -> DMatrix<T> {
+    let data = forward_kinematics(model, q);
+    compute_masked_jacobian_from_data(model, q, &data, joint_idx, mask)
+}
+
+/// Same as [`compute_masked_jacobian`] but takes pre-computed FK data.
+pub fn compute_masked_jacobian_from_data<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
+    joint_idx: usize,
+    mask: &[usize],
+) -> DMatrix<T> {
+    let mut jac = DMatrix::zeros(6, model.nv);
+    let mask_set: std::collections::HashSet<usize> = mask.iter().copied().collect();
+    write_chain_columns_filtered(
+        model,
+        q,
+        data,
+        joint_idx,
+        joint_idx,
+        &mask_set,
+        &mut jac,
+    );
+    jac
+}
+
+// ─── Relative + Masked (combined) ───────────────────────────────────────────
+
+/// Compute the relative Jacobian (ee relative to base) with disabled joints.
+///
+/// Combines relative Jacobian logic with a joint mask.
+pub fn compute_relative_masked_jacobian<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    base_idx: usize,
+    ee_idx: usize,
+    mask: &[usize],
+) -> DMatrix<T> {
+    let data = forward_kinematics(model, q);
+    compute_relative_masked_jacobian_from_data(model, q, &data, base_idx, ee_idx, mask)
+}
+
+/// Same as [`compute_relative_masked_jacobian`] but takes pre-computed FK data.
+pub fn compute_relative_masked_jacobian_from_data<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
+    base_idx: usize,
+    ee_idx: usize,
+    mask: &[usize],
+) -> DMatrix<T> {
+    let j_ee = compute_masked_jacobian_from_data(model, q, data, ee_idx, mask);
+    let j_base = compute_masked_jacobian_from_data(model, q, data, base_idx, mask);
+    j_ee - j_base
+}
+
+// ─── Internal column writers ────────────────────────────────────────────────
+
+/// Write Jacobian columns for joints from `start` up to the root,
+/// computing lever arms relative to the world position of `target_joint`.
+fn write_chain_columns<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
+    start: usize,
+    target_joint: usize,
+    jac: &mut DMatrix<T>,
+) {
+    let target_pos = se3::translation(&data.oMi[target_joint]);
+    let mut current = start;
     while current > 0 {
-        let joint = &model.joints[current];
-        let vi = model.v_idx[current];
-        let nv = joint.joint_type.nv();
+        write_joint_column(model, q, data, current, &target_pos, T::one(), jac);
+        current = model.joints[current].parent;
+    }
+}
 
-        if nv > 0 {
-            // Get joint axis in world frame
-            let s_local = joint.joint_type.motion_subspace(q_slice(model, q, current));
-            let r = se3::rotation_matrix(&data.oMi[current]);
-            let p_joint = se3::translation(&data.oMi[current]);
-
-            for col in 0..nv {
-                // Angular part: R * s_angular
-                let s_ang = Vector3::new(
-                    s_local[(0, col)].clone(),
-                    s_local[(1, col)].clone(),
-                    s_local[(2, col)].clone(),
-                );
-                let s_lin = Vector3::new(
-                    s_local[(3, col)].clone(),
-                    s_local[(4, col)].clone(),
-                    s_local[(5, col)].clone(),
-                );
-
-                let w = &r * s_ang; // angular velocity axis in world
-                let v_lin = &r * s_lin; // linear velocity of joint frame
-
-                // For revolute: linear velocity at target = ω × (p_target - p_joint)
-                let lever = &target_pos - &p_joint;
-                let v_at_target = v_lin + w.cross(&lever);
-
-                jac[(0, vi + col)] = w[0].clone();
-                jac[(1, vi + col)] = w[1].clone();
-                jac[(2, vi + col)] = w[2].clone();
-                jac[(3, vi + col)] = v_at_target[0].clone();
-                jac[(4, vi + col)] = v_at_target[1].clone();
-                jac[(5, vi + col)] = v_at_target[2].clone();
-            }
+/// Write Jacobian columns from `start` up to root, skipping masked joints.
+fn write_chain_columns_filtered<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
+    start: usize,
+    target_joint: usize,
+    mask: &std::collections::HashSet<usize>,
+    jac: &mut DMatrix<T>,
+) {
+    let target_pos = se3::translation(&data.oMi[target_joint]);
+    let mut current = start;
+    while current > 0 {
+        if !mask.contains(&current) {
+            write_joint_column(model, q, data, current, &target_pos, T::one(), jac);
         }
+        current = model.joints[current].parent;
+    }
+}
 
-        current = joint.parent;
+/// Write the Jacobian columns for a single joint into `jac`.
+fn write_joint_column<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
+    joint_idx: usize,
+    target_pos: &Vector3<T>,
+    sign: T,
+    jac: &mut DMatrix<T>,
+) {
+    let joint = &model.joints[joint_idx];
+    let vi = model.v_idx[joint_idx];
+    let nv = joint.joint_type.nv();
+    if nv == 0 {
+        return;
     }
 
-    jac
+    let s_local = joint.joint_type.motion_subspace(q_slice(model, q, joint_idx));
+    let r = se3::rotation_matrix(&data.oMi[joint_idx]);
+    let p_joint = se3::translation(&data.oMi[joint_idx]);
+
+    for col in 0..nv {
+        let s_ang = Vector3::new(
+            s_local[(0, col)].clone(),
+            s_local[(1, col)].clone(),
+            s_local[(2, col)].clone(),
+        );
+        let s_lin = Vector3::new(
+            s_local[(3, col)].clone(),
+            s_local[(4, col)].clone(),
+            s_local[(5, col)].clone(),
+        );
+
+        let w = &r * s_ang;
+        let v_lin = &r * s_lin;
+        let lever = target_pos - &p_joint;
+        let v_at_target = v_lin + w.cross(&lever);
+
+        jac[(0, vi + col)] = sign.clone() * w[0].clone();
+        jac[(1, vi + col)] = sign.clone() * w[1].clone();
+        jac[(2, vi + col)] = sign.clone() * w[2].clone();
+        jac[(3, vi + col)] = sign.clone() * v_at_target[0].clone();
+        jac[(4, vi + col)] = sign.clone() * v_at_target[1].clone();
+        jac[(5, vi + col)] = sign.clone() * v_at_target[2].clone();
+    }
 }
 
 /// Helper: extract the configuration slice for joint `i`.
@@ -129,43 +290,72 @@ mod tests {
             .build()
     }
 
+    /// Three-link arm:  root → j1(Z) → j2(Z) → j3(Z), each offset 1m along X.
+    fn three_link_arm() -> Model<f64> {
+        let offset = se3::from_rotation_and_translation(
+            &nalgebra::Rotation3::identity(),
+            &Vector3::new(1.0, 0.0, 0.0),
+        );
+        ModelBuilder::new()
+            .add_joint(
+                "j1",
+                0,
+                joint::revolute_z(),
+                se3::identity(),
+                LinkInertia::zero(),
+            )
+            .add_joint("j2", 1, joint::revolute_z(), offset.clone(), LinkInertia::zero())
+            .add_joint("j3", 2, joint::revolute_z(), offset, LinkInertia::zero())
+            .build()
+    }
+
+    /// Branched tree:  root → j1 → j2 (chain), root → j3 (branch).
+    fn branched_arm() -> Model<f64> {
+        let offset_x = se3::from_rotation_and_translation(
+            &nalgebra::Rotation3::identity(),
+            &Vector3::new(1.0, 0.0, 0.0),
+        );
+        let offset_y = se3::from_rotation_and_translation(
+            &nalgebra::Rotation3::identity(),
+            &Vector3::new(0.0, 1.0, 0.0),
+        );
+        ModelBuilder::new()
+            .add_joint("j1", 0, joint::revolute_z(), se3::identity(), LinkInertia::zero())
+            .add_joint("j2", 1, joint::revolute_z(), offset_x, LinkInertia::zero())
+            .add_joint("j3", 0, joint::revolute_z(), offset_y, LinkInertia::zero())
+            .build()
+    }
+
+    // ── Original tests (preserved) ──────────────────────────────────────
+
     #[test]
     fn jacobian_two_link_zero_config() {
         let model = two_link_arm();
         let q = vec![0.0, 0.0];
         let jac = compute_joint_jacobian(&model, &q, 2);
 
-        // At q = [0, 0], joint 2 is at (1, 0, 0).
-        // ∂p/∂q1: shoulder rotation about Z → velocity = ω × (1,0,0) = (0,0,1)×(1,0,0) = (0,1,0)
-        // But lever = target - shoulder = (1,0,0) - (0,0,0) = (1,0,0)
-        // v = (0,0,1) × (1,0,0) = (0,1,0) - skipping the linear part as it's zero for revolute
-        assert_relative_eq!(jac[(2, 0)], 1.0, epsilon = 1e-12); // angular z from shoulder
-        assert_relative_eq!(jac[(4, 0)], 1.0, epsilon = 1e-12); // linear y from shoulder
-
-        // ∂p/∂q2: elbow rotation about Z, joint 2 at (1,0,0), lever = (0,0,0)
-        assert_relative_eq!(jac[(2, 1)], 1.0, epsilon = 1e-12); // angular z from elbow
-        assert_relative_eq!(jac[(3, 1)], 0.0, epsilon = 1e-12); // no linear (zero lever)
+        assert_relative_eq!(jac[(2, 0)], 1.0, epsilon = 1e-12);
+        assert_relative_eq!(jac[(4, 0)], 1.0, epsilon = 1e-12);
+        assert_relative_eq!(jac[(2, 1)], 1.0, epsilon = 1e-12);
+        assert_relative_eq!(jac[(3, 1)], 0.0, epsilon = 1e-12);
         assert_relative_eq!(jac[(4, 1)], 0.0, epsilon = 1e-12);
     }
 
     #[test]
     fn jacobian_numerical_validation() {
-        // Validate Jacobian via finite differences.
         let model = two_link_arm();
         let q = vec![0.3, -0.5];
         let jac = compute_joint_jacobian(&model, &q, 2);
-        let joint_idx = 2;
 
         let eps = 1e-8;
         let data_ref = crate::fk::forward_kinematics(&model, &q);
-        let p_ref = se3::translation(&data_ref.oMi[joint_idx]);
+        let p_ref = se3::translation(&data_ref.oMi[2]);
 
-        // Check linear part (rows 3-5) via finite differences on position
         for j in 0..model.nv {
             let mut q_plus = q.clone();
             q_plus[j] += eps;
             let data_plus = crate::fk::forward_kinematics(&model, &q_plus);
-            let p_plus = se3::translation(&data_plus.oMi[joint_idx]);
+            let p_plus = se3::translation(&data_plus.oMi[2]);
 
             let dp = (p_plus - p_ref) / eps;
             assert_relative_eq!(jac[(3, j)], dp[0], epsilon = 1e-5);
@@ -181,5 +371,201 @@ mod tests {
         let j1 = compute_joint_jacobian(&model, &q, 2);
         let j2 = compute_joint_jacobian(&model, &q, 2);
         assert_relative_eq!(j1, j2, epsilon = 1e-14);
+    }
+
+    // ── Relative Jacobian tests ─────────────────────────────────────────
+
+    #[test]
+    fn relative_jacobian_serial_chain() {
+        // base=j1, ee=j3 in three_link_arm (serial chain).
+        // J_rel = J(j3) - J(j1).
+        // j1 is a common ancestor → angular cancels, linear = ω × (p_ee - p_base).
+        // j2, j3 appear only in J(j3) → standard columns.
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+
+        let jac_full_ee = compute_joint_jacobian(&model, &q, 3);
+        let jac_full_base = compute_joint_jacobian(&model, &q, 1);
+        let jac_rel = compute_relative_jacobian(&model, &q, 1, 3);
+
+        // Should equal J(ee) - J(base)
+        let expected = &jac_full_ee - &jac_full_base;
+        assert_relative_eq!(jac_rel, expected, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn relative_jacobian_numerical_validation() {
+        // Validate relative Jacobian via finite differences.
+        // relative_pos = oMi[base]^{-1} * oMi[ee].translation
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+        let jac = compute_relative_jacobian(&model, &q, 1, 3);
+
+        let eps = 1e-8;
+        let data_ref = crate::fk::forward_kinematics(&model, &q);
+        let p_ee = se3::translation(&data_ref.oMi[3]);
+        let p_base = se3::translation(&data_ref.oMi[1]);
+        let rel_ref = &p_ee - &p_base;
+
+        for j in 0..model.nv {
+            let mut q_plus = q.clone();
+            q_plus[j] += eps;
+            let data_plus = crate::fk::forward_kinematics(&model, &q_plus);
+            let p_ee_p = se3::translation(&data_plus.oMi[3]);
+            let p_base_p = se3::translation(&data_plus.oMi[1]);
+            let rel_plus = &p_ee_p - &p_base_p;
+
+            let dp = (&rel_plus - &rel_ref) / eps;
+            assert_relative_eq!(jac[(3, j)], dp[0], epsilon = 1e-4);
+            assert_relative_eq!(jac[(4, j)], dp[1], epsilon = 1e-4);
+            assert_relative_eq!(jac[(5, j)], dp[2], epsilon = 1e-4);
+        }
+    }
+
+    #[test]
+    fn relative_jacobian_branched() {
+        // base=j2 (on chain), ee=j3 (on branch). LCA = universe (0).
+        let model = branched_arm();
+        let q = vec![0.4, -0.2, 0.6];
+        let jac = compute_relative_jacobian(&model, &q, 2, 3);
+
+        // Validate numerically
+        let eps = 1e-8;
+        let data_ref = crate::fk::forward_kinematics(&model, &q);
+        let p_ee = se3::translation(&data_ref.oMi[3]);
+        let p_base = se3::translation(&data_ref.oMi[2]);
+        let rel_ref = &p_ee - &p_base;
+
+        for j in 0..model.nv {
+            let mut q_plus = q.clone();
+            q_plus[j] += eps;
+            let data_plus = crate::fk::forward_kinematics(&model, &q_plus);
+            let p_ee_p = se3::translation(&data_plus.oMi[3]);
+            let p_base_p = se3::translation(&data_plus.oMi[2]);
+            let rel_plus = &p_ee_p - &p_base_p;
+
+            let dp = (&rel_plus - &rel_ref) / eps;
+            assert_relative_eq!(jac[(3, j)], dp[0], epsilon = 1e-4);
+            assert_relative_eq!(jac[(4, j)], dp[1], epsilon = 1e-4);
+            assert_relative_eq!(jac[(5, j)], dp[2], epsilon = 1e-4);
+        }
+    }
+
+    // ── Masked Jacobian tests ───────────────────────────────────────────
+
+    #[test]
+    fn masked_jacobian_excludes_joint() {
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+
+        // Mask out j2 (index 2)
+        let jac = compute_masked_jacobian(&model, &q, 3, &[2]);
+        let jac_full = compute_joint_jacobian(&model, &q, 3);
+
+        // j2 columns should be zero
+        for row in 0..6 {
+            assert_relative_eq!(jac[(row, 1)], 0.0, epsilon = 1e-14);
+        }
+        // j1 and j3 should be identical to full
+        for row in 0..6 {
+            assert_relative_eq!(jac[(row, 0)], jac_full[(row, 0)], epsilon = 1e-14);
+            assert_relative_eq!(jac[(row, 2)], jac_full[(row, 2)], epsilon = 1e-14);
+        }
+    }
+
+    #[test]
+    fn masked_jacobian_empty_mask_equals_full() {
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+
+        let jac_full = compute_joint_jacobian(&model, &q, 3);
+        let jac_masked = compute_masked_jacobian(&model, &q, 3, &[]);
+        assert_relative_eq!(jac_full, jac_masked, epsilon = 1e-14);
+    }
+
+    #[test]
+    fn masked_jacobian_mask_all_gives_zero() {
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+
+        let jac = compute_masked_jacobian(&model, &q, 3, &[1, 2, 3]);
+        assert_relative_eq!(jac, DMatrix::zeros(6, 3), epsilon = 1e-14);
+    }
+
+    #[test]
+    fn masked_jacobian_numerical_validation() {
+        // Mask out j2, verify only j1 and j3 produce the expected finite-diff.
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+        let mask = &[2usize];
+        let jac = compute_masked_jacobian(&model, &q, 3, mask);
+
+        let eps = 1e-8;
+        let data_ref = crate::fk::forward_kinematics(&model, &q);
+        let p_ref = se3::translation(&data_ref.oMi[3]);
+
+        // Only non-masked joints should match finite diff
+        for j in [0usize, 2] {
+            // DOF indices 0 (j1) and 2 (j3)
+            let mut q_plus = q.clone();
+            q_plus[j] += eps;
+            let data_plus = crate::fk::forward_kinematics(&model, &q_plus);
+            let p_plus = se3::translation(&data_plus.oMi[3]);
+
+            let dp = (p_plus - &p_ref) / eps;
+            assert_relative_eq!(jac[(3, j)], dp[0], epsilon = 1e-5);
+            assert_relative_eq!(jac[(4, j)], dp[1], epsilon = 1e-5);
+            assert_relative_eq!(jac[(5, j)], dp[2], epsilon = 1e-5);
+        }
+    }
+
+    // ── Combined: relative + masked ─────────────────────────────────────
+
+    #[test]
+    fn relative_masked_jacobian_combined() {
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+
+        // Relative j1→j3 with j2 masked
+        let jac = compute_relative_masked_jacobian(&model, &q, 1, 3, &[2]);
+
+        // j2 col = 0 (masked)
+        for row in 0..6 {
+            assert_relative_eq!(jac[(row, 1)], 0.0, epsilon = 1e-14);
+        }
+        // j3 column should be non-zero
+        let j3_norm = (0..6)
+            .map(|r| jac[(r, 2)] * jac[(r, 2)])
+            .sum::<f64>()
+            .sqrt();
+        assert!(j3_norm > 0.01, "j3 column should be non-zero");
+    }
+
+    #[test]
+    fn relative_masked_numerical_validation() {
+        let model = three_link_arm();
+        let q = vec![0.3, -0.5, 0.8];
+        let mask = &[2usize];
+        let jac = compute_relative_masked_jacobian(&model, &q, 1, 3, mask);
+
+        let eps = 1e-8;
+        let data_ref = crate::fk::forward_kinematics(&model, &q);
+        let p_ee = se3::translation(&data_ref.oMi[3]);
+        let p_base = se3::translation(&data_ref.oMi[1]);
+        let rel_ref = &p_ee - &p_base;
+
+        // j3 (DOF index 2) should match the relative finite difference
+        let j = 2usize;
+        let mut q_plus = q.clone();
+        q_plus[j] += eps;
+        let data_plus = crate::fk::forward_kinematics(&model, &q_plus);
+        let p_ee_p = se3::translation(&data_plus.oMi[3]);
+        let p_base_p = se3::translation(&data_plus.oMi[1]);
+        let rel_plus = &p_ee_p - &p_base_p;
+        let dp = (&rel_plus - &rel_ref) / eps;
+
+        assert_relative_eq!(jac[(3, j)], dp[0], epsilon = 1e-4);
+        assert_relative_eq!(jac[(4, j)], dp[1], epsilon = 1e-4);
+        assert_relative_eq!(jac[(5, j)], dp[2], epsilon = 1e-4);
     }
 }
