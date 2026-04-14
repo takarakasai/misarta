@@ -37,7 +37,7 @@ pub fn from_rotation_and_translation<T: RealField>(
     trans: &Vector3<T>,
 ) -> SE3<T> {
     SE3::from_parts(
-        Translation3::from(*trans),
+        Translation3::from(trans.clone()),
         UnitQuaternion::from_rotation_matrix(rot),
     )
 }
@@ -60,7 +60,7 @@ pub fn to_homogeneous<T: RealField>(se3: &SE3<T>) -> Matrix4<T> {
 /// Extract the rotation matrix from a placement.
 #[inline]
 pub fn rotation_matrix<T: RealField>(se3: &SE3<T>) -> Matrix3<T> {
-    *se3.rotation.to_rotation_matrix().matrix()
+    se3.rotation.clone().to_rotation_matrix().matrix().clone()
 }
 
 /// Extract the translation vector from a placement.
@@ -86,7 +86,7 @@ pub fn inverse<T: RealField>(se3: &SE3<T>) -> SE3<T> {
 /// Transform a point by a placement.
 #[inline]
 pub fn act_on_point<T: RealField>(se3: &SE3<T>, point: &Vector3<T>) -> Vector3<T> {
-    se3.transform_point(&nalgebra::Point3::from(*point)).coords
+    se3.transform_point(&nalgebra::Point3::from(point.clone())).coords
 }
 
 // ─── Exponential / Logarithm (Lie algebra ↔ Lie group) ──────────────────────
@@ -126,7 +126,7 @@ pub fn exp<T: RealField>(twist: &Motion<T>) -> SE3<T> {
 
 /// Logarithmic map: SE(3) → se(3) twist.
 pub fn log<T: RealField>(se3: &SE3<T>) -> Motion<T> {
-    let rot = se3.rotation.to_rotation_matrix();
+    let rot = se3.rotation.clone().to_rotation_matrix();
     let t = translation(se3);
 
     let angle_axis = rot.scaled_axis();

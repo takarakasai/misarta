@@ -46,11 +46,10 @@ pub fn forward_kinematics<T: RealField>(model: &Model<T>, q: &[T]) -> Data<T> {
 
         // Placement relative to parent = fixed offset * joint motion
         let rel = se3::compose(&joint.placement, &m_joint);
-        data.joint_placements[i] = rel;
-
         // Absolute placement = parent absolute * relative
         let parent_idx = joint.parent;
         data.oMi[i] = se3::compose(&data.oMi[parent_idx], &rel);
+        data.joint_placements[i] = rel;
     }
 
     data
