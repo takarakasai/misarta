@@ -64,7 +64,7 @@ fn autodiff_matches_analytical_jacobian() {
         &nalgebra::Rotation3::identity(),
         &Vector3::new(1.0, 0.0, 0.0),
     );
-    let model = ModelBuilder::new()
+    let model = ModelBuilder::<f64>::new()
         .add_joint(
             "shoulder",
             0,

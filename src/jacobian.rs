@@ -8,12 +8,14 @@
 //! The Jacobian J is 6×nv, where column j corresponds to velocity DOF j.
 //! The top 3 rows are angular velocity, the bottom 3 are linear velocity
 //! (Pinocchio / Featherstone convention).
+//!
+//! Generic over `T: RealField`.
 
 use crate::data::Data;
 use crate::fk::forward_kinematics;
 use crate::model::Model;
 use crate::se3;
-use nalgebra::{DMatrix, Vector3};
+use nalgebra::{DMatrix, RealField, Vector3};
 
 /// Compute the world-frame geometric Jacobian for a specific joint.
 ///
@@ -21,7 +23,11 @@ use nalgebra::{DMatrix, Vector3};
 ///
 /// The Jacobian maps the full velocity vector q̇ to the spatial velocity of
 /// joint `joint_idx` expressed in the world frame.
-pub fn compute_joint_jacobian(model: &Model, q: &[f64], joint_idx: usize) -> DMatrix<f64> {
+pub fn compute_joint_jacobian<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    joint_idx: usize,
+) -> DMatrix<T> {
     assert!(joint_idx > 0 && joint_idx < model.joints.len());
 
     let data = forward_kinematics(model, q);
@@ -31,12 +37,12 @@ pub fn compute_joint_jacobian(model: &Model, q: &[f64], joint_idx: usize) -> DMa
 /// Same as `compute_joint_jacobian` but takes pre-computed FK data.
 ///
 /// Useful when you already have FK results and want to avoid recomputing them.
-pub fn compute_joint_jacobian_from_data(
-    model: &Model,
-    q: &[f64],
-    data: &Data,
+pub fn compute_joint_jacobian_from_data<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
     joint_idx: usize,
-) -> DMatrix<f64> {
+) -> DMatrix<T> {
     let mut jac = DMatrix::zeros(6, model.nv);
 
     // Walk from the target joint back to the root, accumulating columns.
@@ -50,29 +56,36 @@ pub fn compute_joint_jacobian_from_data(
 
         if nv > 0 {
             // Get joint axis in world frame
-            let _qi = model.q_idx[current];
             let s_local = joint.joint_type.motion_subspace(q_slice(model, q, current));
             let r = se3::rotation_matrix(&data.oMi[current]);
             let p_joint = se3::translation(&data.oMi[current]);
 
             for col in 0..nv {
                 // Angular part: R * s_angular
-                let s_ang = Vector3::new(s_local[(0, col)], s_local[(1, col)], s_local[(2, col)]);
-                let s_lin = Vector3::new(s_local[(3, col)], s_local[(4, col)], s_local[(5, col)]);
+                let s_ang = Vector3::new(
+                    s_local[(0, col)].clone(),
+                    s_local[(1, col)].clone(),
+                    s_local[(2, col)].clone(),
+                );
+                let s_lin = Vector3::new(
+                    s_local[(3, col)].clone(),
+                    s_local[(4, col)].clone(),
+                    s_local[(5, col)].clone(),
+                );
 
-                let w = r * s_ang; // angular velocity axis in world
-                let v_lin = r * s_lin; // linear velocity of joint frame
+                let w = &r * s_ang; // angular velocity axis in world
+                let v_lin = &r * s_lin; // linear velocity of joint frame
 
                 // For revolute: linear velocity at target = ω × (p_target - p_joint)
-                let lever = target_pos - p_joint;
+                let lever = &target_pos - &p_joint;
                 let v_at_target = v_lin + w.cross(&lever);
 
-                jac[(0, vi + col)] = w[0];
-                jac[(1, vi + col)] = w[1];
-                jac[(2, vi + col)] = w[2];
-                jac[(3, vi + col)] = v_at_target[0];
-                jac[(4, vi + col)] = v_at_target[1];
-                jac[(5, vi + col)] = v_at_target[2];
+                jac[(0, vi + col)] = w[0].clone();
+                jac[(1, vi + col)] = w[1].clone();
+                jac[(2, vi + col)] = w[2].clone();
+                jac[(3, vi + col)] = v_at_target[0].clone();
+                jac[(4, vi + col)] = v_at_target[1].clone();
+                jac[(5, vi + col)] = v_at_target[2].clone();
             }
         }
 
@@ -83,7 +96,7 @@ pub fn compute_joint_jacobian_from_data(
 }
 
 /// Helper: extract the configuration slice for joint `i`.
-fn q_slice<'a>(model: &Model, q: &'a [f64], i: usize) -> &'a [f64] {
+fn q_slice<'a, T: RealField>(model: &Model<T>, q: &'a [T], i: usize) -> &'a [T] {
     let qi = model.q_idx[i];
     &q[qi..qi + model.joints[i].joint_type.nq()]
 }
@@ -99,7 +112,7 @@ mod tests {
     use approx::assert_relative_eq;
     use nalgebra::Vector3;
 
-    fn two_link_arm() -> Model {
+    fn two_link_arm() -> Model<f64> {
         let offset = se3::from_rotation_and_translation(
             &nalgebra::Rotation3::identity(),
             &Vector3::new(1.0, 0.0, 0.0),

@@ -5,41 +5,42 @@
 //! - **Data** (separate module) holds mutable computation results.
 //!
 //! The model is built via a builder pattern, then frozen as an immutable value.
+//! All types are generic over `T: RealField`.
 
 use crate::joint::JointType;
 use crate::se3::{self, SE3};
-use nalgebra::Vector3;
+use nalgebra::{RealField, Vector3};
 
 // ─── Single joint frame ─────────────────────────────────────────────────────
 
 /// One joint in the kinematic tree.
 #[derive(Debug, Clone)]
-pub struct JointModel {
+pub struct JointModel<T: RealField> {
     /// Human-readable name.
     pub name: String,
     /// Joint type (revolute / prismatic / fixed / free-flyer).
-    pub joint_type: JointType,
+    pub joint_type: JointType<T>,
     /// Parent joint index (0 = universe / root).
     pub parent: usize,
     /// Fixed placement from parent joint frame to this joint's reference frame.
     /// In Pinocchio notation: ¹M_J (joint placement in parent frame).
-    pub placement: SE3,
+    pub placement: SE3<T>,
 }
 
 // ─── Link (body) ────────────────────────────────────────────────────────────
 
 /// Inertial properties of a rigid body (link).
 #[derive(Debug, Clone)]
-pub struct LinkInertia {
-    pub mass: f64,
-    pub center_of_mass: Vector3<f64>,
-    // Rotational inertia could be added later (Matrix3<f64>).
+pub struct LinkInertia<T: RealField> {
+    pub mass: T,
+    pub center_of_mass: Vector3<T>,
+    // Rotational inertia could be added later (Matrix3<T>).
 }
 
-impl LinkInertia {
+impl<T: RealField> LinkInertia<T> {
     pub fn zero() -> Self {
         Self {
-            mass: 0.0,
+            mass: T::zero(),
             center_of_mass: Vector3::zeros(),
         }
     }
@@ -52,11 +53,11 @@ impl LinkInertia {
 /// Joint indices are 1-based; index 0 represents the universe (fixed root).
 /// This matches Pinocchio's convention.
 #[derive(Debug, Clone)]
-pub struct Model {
+pub struct Model<T: RealField> {
     /// Joint models, index 0 is a dummy "universe" joint.
-    pub joints: Vec<JointModel>,
+    pub joints: Vec<JointModel<T>>,
     /// Link inertias, indexed in parallel with `joints`.
-    pub inertias: Vec<LinkInertia>,
+    pub inertias: Vec<LinkInertia<T>>,
     /// Starting index of each joint's configuration in the q vector.
     pub q_idx: Vec<usize>,
     /// Starting index of each joint's velocity in the v vector.
@@ -66,23 +67,23 @@ pub struct Model {
     /// Total velocity dimension.
     pub nv: usize,
     /// Gravity vector in the world frame
-    pub gravity: Vector3<f64>,
+    pub gravity: Vector3<T>,
 }
 
-impl Model {
+impl<T: RealField> Model<T> {
     /// Number of joints (excluding the universe).
     pub fn num_joints(&self) -> usize {
         self.joints.len() - 1
     }
 
     /// Zero configuration vector.
-    pub fn neutral_q(&self) -> Vec<f64> {
-        let mut q = vec![0.0; self.nq];
+    pub fn neutral_q(&self) -> Vec<T> {
+        let mut q = vec![T::zero(); self.nq];
         // For free-flyer joints, set quaternion w to 1.
         for (i, joint) in self.joints.iter().enumerate() {
             if let JointType::FreeFlyer = &joint.joint_type {
                 let idx = self.q_idx[i];
-                q[idx + 6] = 1.0; // qw = 1
+                q[idx + 6] = T::one(); // qw = 1
             }
         }
         q
@@ -92,17 +93,17 @@ impl Model {
 // ─── Builder ────────────────────────────────────────────────────────────────
 
 /// Builder for constructing a `Model` incrementally.
-pub struct ModelBuilder {
-    joints: Vec<JointModel>,
-    inertias: Vec<LinkInertia>,
+pub struct ModelBuilder<T: RealField> {
+    joints: Vec<JointModel<T>>,
+    inertias: Vec<LinkInertia<T>>,
     nq: usize,
     nv: usize,
     q_idx: Vec<usize>,
     v_idx: Vec<usize>,
-    gravity: Vector3<f64>,
+    gravity: Vector3<T>,
 }
 
-impl ModelBuilder {
+impl<T: RealField> ModelBuilder<T> {
     /// Create a new builder with the universe joint at index 0.
     pub fn new() -> Self {
         let universe = JointModel {
@@ -118,12 +119,12 @@ impl ModelBuilder {
             nv: 0,
             q_idx: vec![0],
             v_idx: vec![0],
-            gravity: Vector3::new(0.0, 0.0, -9.81),
+            gravity: Vector3::new(T::zero(), T::zero(), nalgebra::convert(-9.81)),
         }
     }
 
     /// Set the gravity vector.
-    pub fn gravity(mut self, g: Vector3<f64>) -> Self {
+    pub fn gravity(mut self, g: Vector3<T>) -> Self {
         self.gravity = g;
         self
     }
@@ -141,9 +142,9 @@ impl ModelBuilder {
         mut self,
         name: impl Into<String>,
         parent: usize,
-        joint_type: JointType,
-        placement: SE3,
-        inertia: LinkInertia,
+        joint_type: JointType<T>,
+        placement: SE3<T>,
+        inertia: LinkInertia<T>,
     ) -> Self {
         let qi = self.nq;
         let vi = self.nv;
@@ -162,7 +163,7 @@ impl ModelBuilder {
     }
 
     /// Consume the builder and produce an immutable `Model`.
-    pub fn build(self) -> Model {
+    pub fn build(self) -> Model<T> {
         Model {
             joints: self.joints,
             inertias: self.inertias,
@@ -175,7 +176,7 @@ impl ModelBuilder {
     }
 }
 
-impl Default for ModelBuilder {
+impl<T: RealField> Default for ModelBuilder<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -190,7 +191,7 @@ mod tests {
 
     #[test]
     fn build_simple_chain() {
-        let model = ModelBuilder::new()
+        let model = ModelBuilder::<f64>::new()
             .add_joint("j1", 0, joint::revolute_z(), se3::identity(), LinkInertia::zero())
             .add_joint("j2", 1, joint::revolute_z(), se3::identity(), LinkInertia::zero())
             .build();

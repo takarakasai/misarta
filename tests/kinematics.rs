@@ -14,13 +14,13 @@ use std::f64::consts::{FRAC_PI_2, PI};
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
-fn link_offset(x: f64, y: f64, z: f64) -> misarta::se3::SE3 {
+fn link_offset(x: f64, y: f64, z: f64) -> misarta::se3::SE3<f64> {
     se3::from_rotation_and_translation(&Rotation3::identity(), &Vector3::new(x, y, z))
 }
 
 // ─── 3-DOF planar arm ──────────────────────────────────────────────────────
 
-fn three_link_planar() -> misarta::model::Model {
+fn three_link_planar() -> misarta::model::Model<f64> {
     ModelBuilder::new()
         .add_joint("j1", 0, joint::revolute_z(), se3::identity(), LinkInertia::zero())
         .add_joint("j2", 1, joint::revolute_z(), link_offset(1.0, 0.0, 0.0), LinkInertia::zero())

@@ -4,10 +4,12 @@
 //!
 //! The core function is **pure**: `(model, q) → Data`.
 //! No mutation, no hidden state, fully suitable for automatic differentiation.
+//! Generic over `T: RealField`.
 
 use crate::data::Data;
 use crate::model::Model;
 use crate::se3;
+use nalgebra::RealField;
 
 /// Compute forward kinematics for the entire model.
 ///
@@ -23,7 +25,7 @@ use crate::se3;
 /// joint_placements[i] = model.joints[i].placement * joint_type.forward(q_i)
 /// oMi[i] = oMi[parent(i)] * joint_placements[i]
 /// ```
-pub fn forward_kinematics(model: &Model, q: &[f64]) -> Data {
+pub fn forward_kinematics<T: RealField>(model: &Model<T>, q: &[T]) -> Data<T> {
     assert_eq!(
         q.len(),
         model.nq,
@@ -66,7 +68,7 @@ mod tests {
     use nalgebra::Vector3;
     use std::f64::consts::FRAC_PI_2;
 
-    fn two_link_arm() -> Model {
+    fn two_link_arm() -> Model<f64> {
         // Two revolute-Z joints, each link 1m long along X.
         let offset = se3::from_rotation_and_translation(
             &nalgebra::Rotation3::identity(),
