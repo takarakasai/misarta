@@ -11,3 +11,6 @@ pub mod rnea;
 pub mod crba;
 pub mod aba;
 pub mod frames;
+pub mod utils;
+pub mod trajectory;
+pub mod kinematics_utils;
