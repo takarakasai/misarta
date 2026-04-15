@@ -9,7 +9,7 @@
 
 use crate::joint::JointType;
 use crate::se3::{self, SE3};
-use nalgebra::{RealField, Vector3};
+use nalgebra::{Matrix3, RealField, Vector3};
 
 // ─── Single joint frame ─────────────────────────────────────────────────────
 
@@ -34,7 +34,8 @@ pub struct JointModel<T: RealField> {
 pub struct LinkInertia<T: RealField> {
     pub mass: T,
     pub center_of_mass: Vector3<T>,
-    // Rotational inertia could be added later (Matrix3<T>).
+    /// Rotational inertia about the center of mass, expressed in the body frame.
+    pub rotational_inertia: Matrix3<T>,
 }
 
 impl<T: RealField> LinkInertia<T> {
@@ -42,6 +43,7 @@ impl<T: RealField> LinkInertia<T> {
         Self {
             mass: T::zero(),
             center_of_mass: Vector3::zeros(),
+            rotational_inertia: Matrix3::zeros(),
         }
     }
 }
@@ -143,6 +145,9 @@ impl<T: RealField> Model<T> {
             if (a.center_of_mass.clone() - b.center_of_mass.clone()).norm() > epsilon.clone() {
                 return false;
             }
+            if (a.rotational_inertia.clone() - b.rotational_inertia.clone()).norm() > epsilon.clone() {
+                return false;
+            }
         }
         true
     }
@@ -198,6 +203,12 @@ impl<T: RealField> Model<T> {
                 {
                     ok = false;
                     reason.push_str("center_of_mass ");
+                }
+                if (ia.rotational_inertia.clone() - ib.rotational_inertia.clone()).norm()
+                    > epsilon.clone()
+                {
+                    ok = false;
+                    reason.push_str("rotational_inertia ");
                 }
 
                 if ok {
@@ -473,13 +484,13 @@ mod tests {
         let a = ModelBuilder::<f64>::new()
             .add_joint(
                 "j1", 0, joint::revolute_z(), se3::identity(),
-                LinkInertia { mass: 1.0, center_of_mass: nalgebra::Vector3::zeros() },
+                LinkInertia { mass: 1.0, center_of_mass: nalgebra::Vector3::zeros(), rotational_inertia: nalgebra::Matrix3::zeros() },
             )
             .build();
         let b = ModelBuilder::<f64>::new()
             .add_joint(
                 "j1", 0, joint::revolute_z(), se3::identity(),
-                LinkInertia { mass: 2.0, center_of_mass: nalgebra::Vector3::zeros() },
+                LinkInertia { mass: 2.0, center_of_mass: nalgebra::Vector3::zeros(), rotational_inertia: nalgebra::Matrix3::zeros() },
             )
             .build();
         assert!(!a.approx_eq(&b, 1e-12));

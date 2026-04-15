@@ -8,7 +8,7 @@ use misarta::fk::forward_kinematics;
 use misarta::model::{LinkInertia, ModelBuilder};
 use misarta::se3;
 use misarta::joint;
-use nalgebra::{Rotation3, Vector3};
+use nalgebra::{Matrix3, Rotation3, Vector3};
 use std::path::PathBuf;
 
 fn fixture_path(rel: &str) -> PathBuf {
@@ -216,19 +216,19 @@ fn urdf_matches_hand_built_model() {
             "joint1", 0,
             misarta::joint::JointType::Revolute { axis: Vector3::y() },
             offset1,
-            LinkInertia { mass: 0.5, center_of_mass: Vector3::new(0.0, 0.0, 0.1) },
+            LinkInertia { mass: 0.5, center_of_mass: Vector3::new(0.0, 0.0, 0.1), rotational_inertia: Matrix3::new(0.001, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0, 0.0, 0.001) },
         )
         .add_joint(
             "fixed_joint", 0,
             misarta::joint::JointType::Fixed,
             offset_fixed,
-            LinkInertia { mass: 0.1, center_of_mass: Vector3::zeros() },
+            LinkInertia { mass: 0.1, center_of_mass: Vector3::zeros(), rotational_inertia: Matrix3::new(0.0001, 0.0, 0.0, 0.0, 0.0001, 0.0, 0.0, 0.0, 0.0001) },
         )
         .add_joint(
             "joint2", 1,
             misarta::joint::JointType::Revolute { axis: Vector3::y() },
             offset2,
-            LinkInertia { mass: 0.3, center_of_mass: Vector3::new(0.0, 0.0, 0.075) },
+            LinkInertia { mass: 0.3, center_of_mass: Vector3::new(0.0, 0.0, 0.075), rotational_inertia: Matrix3::new(0.0005, 0.0, 0.0, 0.0, 0.0005, 0.0, 0.0, 0.0, 0.0005) },
         )
         .build();
 

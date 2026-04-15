@@ -226,6 +226,71 @@ pub fn force_cross_matrix<T: RealField>(se3: &SE3<T>) -> Matrix6<T> {
     x
 }
 
+// ─── Spatial inertia ────────────────────────────────────────────────────────
+
+/// 6×6 spatial (rigid-body) inertia matrix for Featherstone algorithms.
+///
+/// Given mass `m`, center of mass `c` (in body frame), and rotational inertia `I`
+/// (about the CoM, in body frame), the spatial inertia referred to the joint frame is:
+///
+/// ```text
+///         [ I + m [c]×ᵀ [c]×   m [c]× ]
+/// Ic_j =  [   m [c]×ᵀ           m I₃   ]
+/// ```
+///
+/// Convention: rows 0-2 = angular, rows 3-5 = linear (Featherstone).
+pub fn spatial_inertia<T: RealField>(
+    mass: T,
+    center_of_mass: &Vector3<T>,
+    rotational_inertia: &Matrix3<T>,
+) -> Matrix6<T> {
+    let cx = skew(center_of_mass);
+    let cxt = cx.transpose();
+    let m_eye = Matrix3::identity() * mass.clone();
+
+    // Upper-left: I + m [c]×ᵀ [c]×
+    let ul = rotational_inertia + &cxt * &cx * mass.clone();
+    // Upper-right: m [c]×
+    let ur = &cx * mass.clone();
+    // Lower-left: m [c]×ᵀ
+    let ll = &cxt * mass.clone();
+
+    let mut y = Matrix6::zeros();
+    y.fixed_view_mut::<3, 3>(0, 0).copy_from(&ul);
+    y.fixed_view_mut::<3, 3>(0, 3).copy_from(&ur);
+    y.fixed_view_mut::<3, 3>(3, 0).copy_from(&ll);
+    y.fixed_view_mut::<3, 3>(3, 3).copy_from(&m_eye);
+    y
+}
+
+/// Cross-product operator for spatial motion vectors (Featherstone notation: v×).
+///
+/// Given v = [ω; v_lin], returns the 6×6 matrix such that v × f gives the
+/// spatial force cross product and v × m the spatial motion cross product.
+///
+/// ```text
+/// vx = [ [ω]×    0   ]
+///      [ [v]×  [ω]×  ]
+/// ```
+pub fn motion_cross<T: RealField>(v: &Motion<T>) -> Matrix6<T> {
+    let omega = Vector3::new(v[0].clone(), v[1].clone(), v[2].clone());
+    let vlin = Vector3::new(v[3].clone(), v[4].clone(), v[5].clone());
+    let omega_x = skew(&omega);
+    let vlin_x = skew(&vlin);
+
+    let mut m = Matrix6::zeros();
+    m.fixed_view_mut::<3, 3>(0, 0).copy_from(&omega_x);
+    m.fixed_view_mut::<3, 3>(3, 0).copy_from(&vlin_x);
+    m.fixed_view_mut::<3, 3>(3, 3).copy_from(&omega_x);
+    m
+}
+
+/// Dual cross-product operator for spatial force vectors: v×* = −(v×)ᵀ.
+pub fn force_cross<T: RealField>(v: &Motion<T>) -> Matrix6<T> {
+    let vx = motion_cross(v);
+    -vx.transpose()
+}
+
 // ─── Unit tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]

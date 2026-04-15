@@ -22,7 +22,7 @@ use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
 use crate::joint::JointType;
 use crate::model::{LinkInertia, Model, ModelBuilder};
 use crate::se3;
-use nalgebra::{Rotation3, Vector3};
+use nalgebra::{Matrix3, Rotation3, Vector3};
 use roxmltree::Document;
 use std::collections::HashMap;
 
@@ -337,9 +337,25 @@ fn parse_link_inertia(link_el: &roxmltree::Node) -> LinkInertia<f64> {
             Vector3::zeros()
         };
 
+        let rotational_inertia = if let Some(inertia_el) = inertial
+            .children()
+            .find(|n| n.tag_name().name() == "inertia")
+        {
+            let ixx = inertia_el.attribute("ixx").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let ixy = inertia_el.attribute("ixy").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let ixz = inertia_el.attribute("ixz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let iyy = inertia_el.attribute("iyy").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let iyz = inertia_el.attribute("iyz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let izz = inertia_el.attribute("izz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            Matrix3::new(ixx, ixy, ixz, ixy, iyy, iyz, ixz, iyz, izz)
+        } else {
+            Matrix3::zeros()
+        };
+
         LinkInertia {
             mass,
             center_of_mass: com,
+            rotational_inertia,
         }
     } else {
         LinkInertia::zero()
@@ -458,6 +474,7 @@ pub fn write_urdf_geometry_string(
             || inertia.center_of_mass[0] != 0.0
             || inertia.center_of_mass[1] != 0.0
             || inertia.center_of_mass[2] != 0.0
+            || inertia.rotational_inertia.norm() != 0.0
         {
             out.push_str("    <inertial>\n");
             out.push_str(&format!("      <mass value=\"{}\"/>\n", inertia.mass));
@@ -466,6 +483,11 @@ pub fn write_urdf_geometry_string(
                 inertia.center_of_mass[0],
                 inertia.center_of_mass[1],
                 inertia.center_of_mass[2],
+            ));
+            let ri = &inertia.rotational_inertia;
+            out.push_str(&format!(
+                "      <inertia ixx=\"{}\" ixy=\"{}\" ixz=\"{}\" iyy=\"{}\" iyz=\"{}\" izz=\"{}\"/>\n",
+                ri[(0, 0)], ri[(0, 1)], ri[(0, 2)], ri[(1, 1)], ri[(1, 2)], ri[(2, 2)],
             ));
             out.push_str("    </inertial>\n");
         }
