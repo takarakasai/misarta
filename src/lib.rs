@@ -13,6 +13,7 @@ pub mod crba;
 pub mod aba;
 pub mod frames;
 pub mod manifold;
+pub mod centroidal;
 pub mod ik;
 pub mod limits;
 pub mod utils;
