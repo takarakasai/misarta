@@ -90,6 +90,10 @@ pub struct IlqrConfig {
     pub reg_min: f64,
     pub reg_max: f64,
     pub alphas: Vec<f64>,
+    /// Optional lower bounds for control input (size nv).
+    pub u_min: Option<Vec<f64>>,
+    /// Optional upper bounds for control input (size nv).
+    pub u_max: Option<Vec<f64>>,
 }
 
 impl Default for IlqrConfig {
@@ -101,6 +105,8 @@ impl Default for IlqrConfig {
             reg_min: 1e-8,
             reg_max: 1e8,
             alphas: vec![1.0, 0.5, 0.25, 0.1, 0.05, 0.01],
+            u_min: None,
+            u_max: None,
         }
     }
 }
@@ -138,6 +144,23 @@ fn rollout_controls(
     }
 
     (q_seq, v_seq)
+}
+
+fn clamp_control_in_place(u: &mut [f64], u_min: Option<&[f64]>, u_max: Option<&[f64]>) {
+    if let Some(min_v) = u_min {
+        assert_eq!(min_v.len(), u.len());
+    }
+    if let Some(max_v) = u_max {
+        assert_eq!(max_v.len(), u.len());
+    }
+    for i in 0..u.len() {
+        if let Some(min_v) = u_min {
+            u[i] = u[i].max(min_v[i]);
+        }
+        if let Some(max_v) = u_max {
+            u[i] = u[i].min(max_v[i]);
+        }
+    }
 }
 
 fn evaluate_trajectory_cost(
@@ -214,9 +237,26 @@ pub fn solve_ilqr(
     let nx = 2 * model.nv;
     let nu = model.nv;
 
+    if let Some(u_min) = &config.u_min {
+        assert_eq!(u_min.len(), nu);
+    }
+    if let Some(u_max) = &config.u_max {
+        assert_eq!(u_max.len(), nu);
+    }
+    if let (Some(u_min), Some(u_max)) = (&config.u_min, &config.u_max) {
+        for i in 0..nu {
+            assert!(u_min[i] <= u_max[i], "u_min[{}] > u_max[{}]", i, i);
+        }
+    }
+
     let mut u_seq = u_init.to_vec();
-    for u in &u_seq {
+    for u in &mut u_seq {
         assert_eq!(u.len(), nu);
+        clamp_control_in_place(
+            u,
+            config.u_min.as_deref(),
+            config.u_max.as_deref(),
+        );
     }
 
     let (mut q_seq, mut v_seq) = rollout_controls(model, q0, v0, &u_seq, dt);
@@ -328,6 +368,11 @@ pub fn solve_ilqr(
                 for i in 0..nu {
                     cand_u[k][i] = u_seq[k][i] + du[i];
                 }
+                clamp_control_in_place(
+                    &mut cand_u[k],
+                    config.u_min.as_deref(),
+                    config.u_max.as_deref(),
+                );
 
                 let (q_next, v_next) =
                     discrete_dynamics_step(model, &cand_q[k], &cand_v[k], &cand_u[k], dt);
@@ -1211,6 +1256,52 @@ mod tests {
         }
         for v in &result.v_seq {
             assert_eq!(v.len(), model.nv);
+        }
+    }
+
+    #[test]
+    fn ilqr_respects_input_bounds() {
+        let model = simple_revolute_model();
+        let q0 = vec![1.0];
+        let v0 = vec![0.0];
+        let n = 20usize;
+
+        // Intentionally out-of-bounds initializer to verify internal clipping.
+        let u_init = vec![vec![2.0]; n];
+        let q_ref_seq = vec![vec![0.0]; n + 1];
+        let v_ref_seq = vec![vec![0.0]; n + 1];
+        let u_ref_seq = vec![vec![0.0]; n];
+
+        let q_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![40.0, 2.0]));
+        let r_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![0.01]));
+        let qf_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![80.0, 3.0]));
+
+        let cfg = IlqrConfig {
+            max_iters: 10,
+            u_min: Some(vec![-0.05]),
+            u_max: Some(vec![0.05]),
+            ..IlqrConfig::default()
+        };
+
+        let result = solve_ilqr(
+            &model,
+            &q0,
+            &v0,
+            &u_init,
+            &q_ref_seq,
+            &v_ref_seq,
+            &u_ref_seq,
+            &q_weight,
+            &r_weight,
+            &qf_weight,
+            0.02,
+            1e-6,
+            &cfg,
+        );
+
+        for uk in &result.u_seq {
+            assert!(uk[0] >= -0.05 - 1e-12);
+            assert!(uk[0] <= 0.05 + 1e-12);
         }
     }
 }
