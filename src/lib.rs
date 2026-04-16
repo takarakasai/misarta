@@ -16,6 +16,7 @@ pub mod manifold;
 pub mod centroidal;
 pub mod ik;
 pub mod limits;
+pub mod optimization;
 pub mod utils;
 pub mod trajectory;
 pub mod kinematics_utils;
