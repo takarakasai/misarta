@@ -35,6 +35,103 @@ pub struct DiscreteDynamicsLinearization {
     pub v_next: Vec<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StageQuadraticApproximation {
+    /// Scalar stage cost value at the expansion point.
+    pub l0: f64,
+    /// First derivative w.r.t. state tangent `x = [δq; v]` (size `2nv`).
+    pub lx: DVector<f64>,
+    /// First derivative w.r.t. input `u` (size `nv`).
+    pub lu: DVector<f64>,
+    /// Second derivative w.r.t. state (`2nv × 2nv`).
+    pub lxx: DMatrix<f64>,
+    /// Second derivative w.r.t. input (`nv × nv`).
+    pub luu: DMatrix<f64>,
+    /// Cross derivative (`nv × 2nv`) = ∂²l/∂u∂x.
+    pub lux: DMatrix<f64>,
+}
+
+/// Build tangent-state error `x_err = [q_ref ⊖ q; v - v_ref]`.
+pub fn state_error_tangent(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+    q_ref: &[f64],
+    v_ref: &[f64],
+) -> DVector<f64> {
+    assert_eq!(q.len(), model.nq);
+    assert_eq!(q_ref.len(), model.nq);
+    assert_eq!(v.len(), model.nv);
+    assert_eq!(v_ref.len(), model.nv);
+
+    let dq = manifold::difference(model, q_ref, q);
+    let mut out = DVector::<f64>::zeros(2 * model.nv);
+    for i in 0..model.nv {
+        out[i] = dq[i];
+        out[model.nv + i] = v[i] - v_ref[i];
+    }
+    out
+}
+
+/// Quadratic stage-cost approximation for MPC / iLQR style solvers.
+///
+/// Defines
+///
+/// `l(x,u) = 0.5 * x_err^T Q x_err + 0.5 * u_err^T R u_err`
+///
+/// where
+///
+/// - `x_err = [q_ref ⊖ q; v - v_ref]` in tangent coordinates (`2nv`)
+/// - `u_err = u - u_ref` (`nv`)
+///
+/// and returns first/second derivatives:
+///
+/// - `l_x = Q x_err`
+/// - `l_u = R u_err`
+/// - `l_xx = Q`, `l_uu = R`, `l_ux = 0`
+pub fn quadratic_stage_cost_approximation(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+    u: &[f64],
+    q_ref: &[f64],
+    v_ref: &[f64],
+    u_ref: &[f64],
+    q_weight: &DMatrix<f64>,
+    r_weight: &DMatrix<f64>,
+) -> StageQuadraticApproximation {
+    assert_eq!(u.len(), model.nv);
+    assert_eq!(u_ref.len(), model.nv);
+
+    let nx = 2 * model.nv;
+    assert_eq!(q_weight.nrows(), nx);
+    assert_eq!(q_weight.ncols(), nx);
+    assert_eq!(r_weight.nrows(), model.nv);
+    assert_eq!(r_weight.ncols(), model.nv);
+
+    let x_err = state_error_tangent(model, q, v, q_ref, v_ref);
+    let u_err = DVector::from_iterator(model.nv, (0..model.nv).map(|i| u[i] - u_ref[i]));
+
+    let qx = q_weight * &x_err;
+    let ru = r_weight * &u_err;
+
+    let l0 = 0.5 * x_err.dot(&qx) + 0.5 * u_err.dot(&ru);
+    let lx = qx;
+    let lu = ru;
+    let lxx = q_weight.clone();
+    let luu = r_weight.clone();
+    let lux = DMatrix::<f64>::zeros(model.nv, nx);
+
+    StageQuadraticApproximation {
+        l0,
+        lx,
+        lu,
+        lxx,
+        luu,
+        lux,
+    }
+}
+
 /// Linearize a joint position tracking residual using analytical Jacobian.
 ///
 /// Residual is `r(q) = target - p_joint(q)` (3D), and Jacobian is
@@ -331,5 +428,130 @@ mod tests {
 
         assert_relative_eq!(dx_pred[0], dx_actual[0], epsilon = 2e-6);
         assert_relative_eq!(dx_pred[1], dx_actual[1], epsilon = 2e-6);
+    }
+
+    #[test]
+    fn quadratic_stage_cost_shapes_and_hessians() {
+        let model = simple_revolute_model();
+        let q = vec![0.2];
+        let v = vec![-0.3];
+        let u = vec![0.1];
+        let q_ref = vec![0.0];
+        let v_ref = vec![0.0];
+        let u_ref = vec![0.0];
+
+        let q_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![10.0, 1.0]));
+        let r_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![0.5]));
+
+        let qa = quadratic_stage_cost_approximation(
+            &model, &q, &v, &u, &q_ref, &v_ref, &u_ref, &q_weight, &r_weight,
+        );
+
+        assert_eq!(qa.lx.len(), 2);
+        assert_eq!(qa.lu.len(), 1);
+        assert_eq!(qa.lxx.nrows(), 2);
+        assert_eq!(qa.lxx.ncols(), 2);
+        assert_eq!(qa.luu.nrows(), 1);
+        assert_eq!(qa.luu.ncols(), 1);
+        assert_eq!(qa.lux.nrows(), 1);
+        assert_eq!(qa.lux.ncols(), 2);
+
+        assert_relative_eq!(qa.lxx[(0, 0)], q_weight[(0, 0)], epsilon = 1e-12);
+        assert_relative_eq!(qa.lxx[(1, 1)], q_weight[(1, 1)], epsilon = 1e-12);
+        assert_relative_eq!(qa.luu[(0, 0)], r_weight[(0, 0)], epsilon = 1e-12);
+        assert_relative_eq!(qa.lux[(0, 0)], 0.0, epsilon = 1e-12);
+        assert_relative_eq!(qa.lux[(0, 1)], 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn quadratic_stage_cost_gradients_match_finite_difference() {
+        let model = simple_revolute_model();
+        let q = vec![0.25];
+        let v = vec![0.15];
+        let u = vec![-0.07];
+        let q_ref = vec![0.05];
+        let v_ref = vec![0.0];
+        let u_ref = vec![0.0];
+
+        let q_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![4.0, 2.0]));
+        let r_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![3.0]));
+
+        let qa = quadratic_stage_cost_approximation(
+            &model, &q, &v, &u, &q_ref, &v_ref, &u_ref, &q_weight, &r_weight,
+        );
+
+        let eps = 1e-7;
+
+        // Finite-difference for x = [δq, δv]
+        // x[0] direction perturbs configuration on manifold.
+        let q_plus = manifold::integrate(&model, &q, &[eps], 1.0);
+        let q_minus = manifold::integrate(&model, &q, &[-eps], 1.0);
+        let l_plus_q = quadratic_stage_cost_approximation(
+            &model, &q_plus, &v, &u, &q_ref, &v_ref, &u_ref, &q_weight, &r_weight,
+        )
+        .l0;
+        let l_minus_q = quadratic_stage_cost_approximation(
+            &model, &q_minus, &v, &u, &q_ref, &v_ref, &u_ref, &q_weight, &r_weight,
+        )
+        .l0;
+        let gx_q_fd = (l_plus_q - l_minus_q) / (2.0 * eps);
+
+        // x[1] direction perturbs velocity.
+        let l_plus_v = quadratic_stage_cost_approximation(
+            &model,
+            &q,
+            &[v[0] + eps],
+            &u,
+            &q_ref,
+            &v_ref,
+            &u_ref,
+            &q_weight,
+            &r_weight,
+        )
+        .l0;
+        let l_minus_v = quadratic_stage_cost_approximation(
+            &model,
+            &q,
+            &[v[0] - eps],
+            &u,
+            &q_ref,
+            &v_ref,
+            &u_ref,
+            &q_weight,
+            &r_weight,
+        )
+        .l0;
+        let gx_v_fd = (l_plus_v - l_minus_v) / (2.0 * eps);
+
+        // u direction
+        let l_plus_u = quadratic_stage_cost_approximation(
+            &model,
+            &q,
+            &v,
+            &[u[0] + eps],
+            &q_ref,
+            &v_ref,
+            &u_ref,
+            &q_weight,
+            &r_weight,
+        )
+        .l0;
+        let l_minus_u = quadratic_stage_cost_approximation(
+            &model,
+            &q,
+            &v,
+            &[u[0] - eps],
+            &q_ref,
+            &v_ref,
+            &u_ref,
+            &q_weight,
+            &r_weight,
+        )
+        .l0;
+        let gu_fd = (l_plus_u - l_minus_u) / (2.0 * eps);
+
+        assert_relative_eq!(qa.lx[0], gx_q_fd, epsilon = 1e-6);
+        assert_relative_eq!(qa.lx[1], gx_v_fd, epsilon = 1e-6);
+        assert_relative_eq!(qa.lu[0], gu_fd, epsilon = 1e-6);
     }
 }
