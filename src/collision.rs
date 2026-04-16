@@ -2,10 +2,72 @@
 //!
 //! Provides collision and distance queries for a `GeometryModel` attached to a
 //! kinematic `Model<f64>` at a given configuration `q`.
+//!
+//! # Allowed Collision Matrix (ACM)
+//!
+//! An [`AllowedCollisionMatrix`] is a set of geometry-object-index pairs
+//! `(a, b)` that should be **ignored** during collision checks.  Common uses:
+//! - Skip adjacent links that are physically connected (use
+//!   [`AllowedCollisionMatrix::from_adjacent_links`]).
+//! - Whitelist known penetrations (e.g. hand mounted on wrist).
+//!
+//! Pass an `Option<&AllowedCollisionMatrix>` to the `*_acm` query variants.
+//! The original `ignore_adjacent_links: bool` API is preserved unchanged.
 
 use crate::fk::forward_kinematics;
 use crate::geometry::{GeometryModel, GeometryShape};
 use crate::model::Model;
+use std::collections::HashSet;
+
+// ─── AllowedCollisionMatrix ───────────────────────────────────────────────────
+
+/// A set of geometry-object-index pairs whose collisions are explicitly allowed
+/// (ignored during collision queries).
+///
+/// Pairs are stored as `(min(a,b), max(a,b))` so they are order-independent.
+#[derive(Debug, Clone, Default)]
+pub struct AllowedCollisionMatrix {
+    allowed: HashSet<(usize, usize)>,
+}
+
+impl AllowedCollisionMatrix {
+    /// Create an empty ACM (no pairs allowed).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allow the pair `(a, b)`.
+    pub fn allow(&mut self, a: usize, b: usize) {
+        self.allowed.insert((a.min(b), a.max(b)));
+    }
+
+    /// Remove a previously allowed pair.
+    pub fn disallow(&mut self, a: usize, b: usize) {
+        self.allowed.remove(&(a.min(b), a.max(b)));
+    }
+
+    /// Returns `true` if the pair `(a, b)` is in the allowed set.
+    pub fn is_allowed(&self, a: usize, b: usize) -> bool {
+        self.allowed.contains(&(a.min(b), a.max(b)))
+    }
+
+    /// Build an ACM that allows all pairs whose parent joints are the same or
+    /// are direct parent–child (i.e. the same logic as `ignore_adjacent_links`).
+    pub fn from_adjacent_links(model: &Model<f64>, gmodel: &GeometryModel) -> Self {
+        let mut acm = Self::new();
+        let n = gmodel.objects.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let ja = gmodel.objects[i].parent_joint;
+                let jb = gmodel.objects[j].parent_joint;
+                if are_adjacent_joints(model, ja, jb) {
+                    acm.allow(i, j);
+                }
+            }
+        }
+        acm
+    }
+}
 
 /// Returns `true` if the two joint indices are the same or are direct parent–child.
 ///
@@ -194,6 +256,165 @@ pub fn minimum_distance(
     }
 
     min_d
+}
+
+// ─── ACM-aware query variants ─────────────────────────────────────────────────
+
+/// Like [`collision_pairs`] but filters via an [`AllowedCollisionMatrix`].
+///
+/// A pair `(a, b)` is skipped if `acm.is_allowed(a, b)`.  Pass `None` to
+/// apply no filtering.
+pub fn collision_pairs_acm(
+    model: &Model<f64>,
+    gmodel: &GeometryModel,
+    q: &[f64],
+    acm: Option<&AllowedCollisionMatrix>,
+) -> Vec<CollisionPair> {
+    let objects = build_collision_objects(model, gmodel, q);
+    let mut out = Vec::new();
+
+    for i in 0..objects.len() {
+        for j in (i + 1)..objects.len() {
+            let a = &objects[i];
+            let b = &objects[j];
+
+            if let Some(m) = acm {
+                if m.is_allowed(a.index, b.index) {
+                    continue;
+                }
+            }
+
+            if query::intersection_test(&a.world_pose, &*a.shape, &b.world_pose, &*b.shape)
+                .unwrap_or(false)
+            {
+                out.push(CollisionPair { a: a.index, b: b.index });
+            }
+        }
+    }
+    out
+}
+
+/// Like [`has_collision`] but filters via an [`AllowedCollisionMatrix`].
+pub fn has_collision_acm(
+    model: &Model<f64>,
+    gmodel: &GeometryModel,
+    q: &[f64],
+    acm: Option<&AllowedCollisionMatrix>,
+) -> bool {
+    !collision_pairs_acm(model, gmodel, q, acm).is_empty()
+}
+
+/// Like [`minimum_distance`] but filters via an [`AllowedCollisionMatrix`].
+///
+/// Returns `(pair, distance)` for the closest pair, or `None` if no
+/// eligible pairs exist.
+pub fn minimum_distance_acm(
+    model: &Model<f64>,
+    gmodel: &GeometryModel,
+    q: &[f64],
+    acm: Option<&AllowedCollisionMatrix>,
+) -> Option<(CollisionPair, f64)> {
+    let objects = build_collision_objects(model, gmodel, q);
+    let mut best: Option<(CollisionPair, f64)> = None;
+
+    for i in 0..objects.len() {
+        for j in (i + 1)..objects.len() {
+            let a = &objects[i];
+            let b = &objects[j];
+
+            if let Some(m) = acm {
+                if m.is_allowed(a.index, b.index) {
+                    continue;
+                }
+            }
+
+            let d = query::distance(&a.world_pose, &*a.shape, &b.world_pose, &*b.shape)
+                .unwrap_or(f64::INFINITY);
+
+            let better = match &best {
+                Some((_, bd)) => d < *bd,
+                None => true,
+            };
+            if better {
+                best = Some((CollisionPair { a: a.index, b: b.index }, d));
+            }
+        }
+    }
+
+    best
+}
+
+// ─── Collision potential & gradient ───────────────────────────────────────────
+
+/// Compute the scalar collision *avoidance potential* at configuration `q`.
+///
+/// For each geometry pair `(a, b)` not in `acm`, computes:
+///
+/// ```text
+/// V = Σ  0.5 * max(0, margin − d_ab)²
+/// ```
+///
+/// where `d_ab` is the separation distance (0 when penetrating).  A large
+/// potential indicates the robot is near or in collision.
+pub fn collision_potential(
+    model: &Model<f64>,
+    gmodel: &GeometryModel,
+    q: &[f64],
+    acm: Option<&AllowedCollisionMatrix>,
+    safety_margin: f64,
+) -> f64 {
+    let objects = build_collision_objects(model, gmodel, q);
+    let mut v = 0.0_f64;
+
+    for i in 0..objects.len() {
+        for j in (i + 1)..objects.len() {
+            let a = &objects[i];
+            let b = &objects[j];
+
+            if let Some(m) = acm {
+                if m.is_allowed(a.index, b.index) {
+                    continue;
+                }
+            }
+
+            let d = query::distance(&a.world_pose, &*a.shape, &b.world_pose, &*b.shape)
+                .unwrap_or(f64::INFINITY);
+
+            let pen = (safety_margin - d).max(0.0);
+            v += 0.5 * pen * pen;
+        }
+    }
+    v
+}
+
+/// Compute the gradient ∂V/∂q of the collision potential via central finite
+/// differences.
+///
+/// Returns an `nv`-dimensional vector pointing in the direction of increasing
+/// potential (i.e. toward collision).  To repel from collision, subtract a
+/// scaled version of this from the joint velocity step.
+pub fn collision_potential_gradient(
+    model: &Model<f64>,
+    gmodel: &GeometryModel,
+    q: &[f64],
+    acm: Option<&AllowedCollisionMatrix>,
+    safety_margin: f64,
+    eps: f64,
+) -> Vec<f64> {
+    let nv = model.nv;
+    let mut grad = vec![0.0_f64; nv];
+
+    for k in 0..nv {
+        let mut q_plus = q.to_vec();
+        let mut q_minus = q.to_vec();
+        q_plus[k] += eps;
+        q_minus[k] -= eps;
+        let v_plus = collision_potential(model, gmodel, &q_plus, acm, safety_margin);
+        let v_minus = collision_potential(model, gmodel, &q_minus, acm, safety_margin);
+        grad[k] = (v_plus - v_minus) / (2.0 * eps);
+    }
+
+    grad
 }
 
 #[cfg(test)]
@@ -415,5 +636,145 @@ mod tests {
         let q = vec![0.0];
         // j1 and j3 are NOT direct parent-child → still reported even with flag
         assert!(has_collision(&model, &gm, &q, true));
+    }
+
+    // ─── ACM tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn acm_allow_pair_suppresses_collision() {
+        let model = two_joint_model();
+        let mut gm = GeometryModel::new();
+        gm.add(GeometryObject {
+            name: "s1".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 1.0 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "s2".into(),
+            parent_joint: 2,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 1.0 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let q = vec![0.0];
+        // Without ACM: collision detected
+        assert!(has_collision_acm(&model, &gm, &q, None));
+
+        // With ACM allowing (0,1): suppressed
+        let mut acm = AllowedCollisionMatrix::new();
+        acm.allow(0, 1);
+        assert!(!has_collision_acm(&model, &gm, &q, Some(&acm)));
+    }
+
+    #[test]
+    fn acm_from_adjacent_links_builds_correctly() {
+        let model = two_joint_model();
+        let mut gm = GeometryModel::new();
+        // Both objects on joint 1 (same → adjacent)
+        gm.add(GeometryObject {
+            name: "a".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 1.0 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "b".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 1.0 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let q = vec![0.0];
+        let acm = AllowedCollisionMatrix::from_adjacent_links(&model, &gm);
+        assert!(acm.is_allowed(0, 1));
+        assert!(!has_collision_acm(&model, &gm, &q, Some(&acm)));
+    }
+
+    #[test]
+    fn minimum_distance_acm_returns_pair_and_distance() {
+        let model = two_joint_model();
+        let mut gm = GeometryModel::new();
+        gm.add(GeometryObject {
+            name: "s1".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.5 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "s2".into(),
+            parent_joint: 2,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.5 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let q = vec![0.0];
+        let (pair, d) = minimum_distance_acm(&model, &gm, &q, None).unwrap();
+        assert_eq!(pair, CollisionPair { a: 0, b: 1 });
+        assert_relative_eq!(d, 0.5, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn collision_potential_positive_when_inside_margin() {
+        let model = two_joint_model();
+        let mut gm = GeometryModel::new();
+        gm.add(GeometryObject {
+            name: "s1".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.5 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "s2".into(),
+            parent_joint: 2,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.5 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let q = vec![0.0]; // distance = 0.5
+        let v = collision_potential(&model, &gm, &q, None, 1.0); // margin=1.0 > distance
+        assert!(v > 0.0, "Potential should be positive within margin");
+    }
+
+    #[test]
+    fn collision_potential_zero_when_outside_margin() {
+        let model = two_joint_model();
+        let mut gm = GeometryModel::new();
+        gm.add(GeometryObject {
+            name: "s1".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.1 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "s2".into(),
+            parent_joint: 2,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.1 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let q = vec![0.0]; // distance = 1.5 - 0.2 = 1.3
+        let v = collision_potential(&model, &gm, &q, None, 0.5); // margin=0.5 < 1.3
+        assert_eq!(v, 0.0, "Potential should be zero outside margin");
     }
 }

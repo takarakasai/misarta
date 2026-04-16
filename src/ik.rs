@@ -13,6 +13,8 @@ use crate::limits::JointLimits;
 use crate::manifold;
 use crate::model::Model;
 use crate::se3;
+use crate::collision::{AllowedCollisionMatrix, collision_potential_gradient, has_collision_acm};
+use crate::geometry::GeometryModel;
 use nalgebra::{DMatrix, DVector, Isometry3, UnitQuaternion, Vector3};
 
 #[derive(Debug, Clone)]
@@ -474,6 +476,165 @@ pub fn solve_two_task_position_ik(
     }
 }
 
+// ─── Collision-aware IK ───────────────────────────────────────────────────────
+
+/// Configuration for collision-aware IK.
+#[derive(Debug, Clone)]
+pub struct CollisionConfig {
+    /// Safety margin around geometry objects (meters).  Pairs closer than this
+    /// distance generate a repulsion gradient.
+    pub safety_margin: f64,
+    /// Weight applied to the repulsion gradient relative to the IK step.
+    /// Typical range: 0.1 – 5.0.
+    pub collision_weight: f64,
+    /// Finite-difference step size for gradient computation.  Default: 1e-4.
+    pub fd_eps: f64,
+    /// Optional ACM; pairs in the ACM are never included in the potential.
+    pub acm: Option<AllowedCollisionMatrix>,
+}
+
+impl Default for CollisionConfig {
+    fn default() -> Self {
+        Self {
+            safety_margin: 0.05,
+            collision_weight: 1.0,
+            fd_eps: 1e-4,
+            acm: None,
+        }
+    }
+}
+
+/// Solve a joint-position IK while repelling from geometry collisions.
+///
+/// At each iteration the standard DLS position step `Δq₁` is computed, then a
+/// repulsion term
+///
+/// ```text
+/// Δq_rep = −collision_weight · ∇V(q)
+/// ```
+///
+/// is added, where `∇V` is the gradient of the collision potential
+/// (see [`collision_potential_gradient`]).
+///
+/// The repulsion is applied in the null-space of the IK Jacobian so the
+/// primary task (end-effector position) is disturbed as little as possible:
+///
+/// ```text
+/// Δq = Δq₁ + N · Δq_rep
+/// ```
+///
+/// # Parameters
+/// - `model` – kinematic model.
+/// - `gmodel` – geometry model used for collision checks.
+/// - `q0` – initial configuration.
+/// - `joint_idx` – joint whose translation should reach `target`.
+/// - `target` – desired world-frame position.
+/// - `cc` – collision configuration.
+/// - `config` – IK solver configuration.
+pub fn solve_joint_position_ik_with_collision_avoidance(
+    model: &Model<f64>,
+    gmodel: &GeometryModel,
+    q0: &[f64],
+    joint_idx: usize,
+    target: Vector3<f64>,
+    cc: &CollisionConfig,
+    config: &IkConfig,
+) -> IkResult {
+    assert!(joint_idx > 0 && joint_idx < model.joints.len());
+
+    let acm_ref = cc.acm.as_ref();
+
+    let mut q = manifold::normalize_configuration(model, q0);
+    if let Some(lim) = &config.joint_limits {
+        q = limits::clamp_configuration(model, &q, lim);
+    }
+
+    let mut last_error = 0.0_f64;
+
+    for iter in 0..config.max_iters {
+        let data = forward_kinematics(model, &q);
+        let p = se3::translation(&data.oMi[joint_idx]);
+        let e_vec = DVector::from_iterator(3, (target - p).iter().copied());
+
+        let error_norm = e_vec.norm();
+        last_error = error_norm;
+        if error_norm <= config.tol_error {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: error_norm,
+                status: IkStatus::Converged,
+            };
+        }
+
+        // Primary task step (linear rows of Jacobian)
+        let j_full = compute_joint_jacobian(model, &q, joint_idx);
+        let j = j_full.rows(3, 3).into_owned();
+
+        let Some(dq1) = dls_step(&j, &e_vec, &config.damping) else {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: last_error,
+                status: IkStatus::NumericalFailure,
+            };
+        };
+
+        // Null-space projector
+        let Some(j_pinv) = dls_pseudoinverse(&j, &config.damping) else {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: last_error,
+                status: IkStatus::NumericalFailure,
+            };
+        };
+        let n = DMatrix::<f64>::identity(model.nv, model.nv) - (&j_pinv * &j);
+
+        // Collision repulsion gradient
+        let grad = collision_potential_gradient(
+            model,
+            gmodel,
+            &q,
+            acm_ref,
+            cc.safety_margin,
+            cc.fd_eps,
+        );
+        let grad_vec = DVector::from_vec(grad);
+        let dq_rep = -cc.collision_weight * grad_vec;
+
+        // Combine: primary + null-space repulsion
+        let dq = dq1 + &n * dq_rep;
+
+        let step_norm = dq.norm();
+        if step_norm <= config.tol_step {
+            break;
+        }
+
+        let (q_new, _) = apply_step_with_limits(model, q, dq, config);
+        q = q_new;
+    }
+
+    IkResult {
+        q,
+        iterations: config.max_iters,
+        final_error_norm: last_error,
+        status: IkStatus::MaxIterations,
+    }
+}
+
+/// Returns `true` if the configuration `q` has any unallowed collision.
+///
+/// Thin convenience wrapper around [`has_collision_acm`].
+pub fn configuration_is_collision_free(
+    model: &Model<f64>,
+    gmodel: &GeometryModel,
+    q: &[f64],
+    acm: Option<&AllowedCollisionMatrix>,
+) -> bool {
+    !has_collision_acm(model, gmodel, q, acm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +839,100 @@ mod tests {
         let p_primary = se3::translation(&data.oMi[2]);
         assert_relative_eq!(p_primary[0], primary_target[0], epsilon = 1e-3);
         assert_relative_eq!(p_primary[1], primary_target[1], epsilon = 1e-3);
+    }
+
+    #[test]
+    fn collision_aware_ik_reduces_potential_vs_plain_ik() {
+        use crate::collision::collision_potential;
+        use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
+
+        // 2-link arm; add a large obstacle sphere at the mid-point of link 2
+        // so that naive IK runs into it.
+        let model = two_link_planar();
+
+        let mut gm = GeometryModel::new();
+        // Link 1 geometry (small sphere at joint 1)
+        gm.add(GeometryObject {
+            name: "link1".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.1 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        // Link 2 geometry (small sphere at joint 2)
+        gm.add(GeometryObject {
+            name: "link2".into(),
+            parent_joint: 2,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.1 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let target = Vector3::new(0.5, 0.8, 0.0);
+        let q0 = vec![0.0, 0.0];
+
+        let cfg = IkConfig {
+            max_iters: 80,
+            step_size: 0.5,
+            damping: Damping::Fixed(1e-2),
+            ..IkConfig::default()
+        };
+
+        // Plain IK (no collision avoidance)
+        let plain_result = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
+
+        // Collision-aware IK with a safety margin that activates between the two spheres
+        let acm = AllowedCollisionMatrix::from_adjacent_links(&model, &gm);
+        let cc = CollisionConfig {
+            safety_margin: 0.5,
+            collision_weight: 2.0,
+            acm: Some(acm.clone()),
+            ..CollisionConfig::default()
+        };
+        let ca_result = solve_joint_position_ik_with_collision_avoidance(
+            &model, &gm, &q0, 2, target, &cc, &cfg,
+        );
+
+        // The collision-aware result should have lower or equal potential
+        let v_plain = collision_potential(&model, &gm, &plain_result.q, Some(&acm), cc.safety_margin);
+        let v_ca = collision_potential(&model, &gm, &ca_result.q, Some(&acm), cc.safety_margin);
+        assert!(
+            v_ca <= v_plain + 1e-9,
+            "Collision-aware IK (V={v_ca:.4}) should have ≤ potential than plain IK (V={v_plain:.4})",
+        );
+    }
+
+    #[test]
+    fn configuration_is_collision_free_detects_collision() {
+        use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
+
+        let model = two_link_planar();
+        let mut gm = GeometryModel::new();
+        // Two large spheres — they will overlap at q=0
+        gm.add(GeometryObject {
+            name: "s1".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.8 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "s2".into(),
+            parent_joint: 2,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.8 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let acm = AllowedCollisionMatrix::from_adjacent_links(&model, &gm);
+        // j1 and j2 are adjacent (parent-child) → allowed → still appears collision-free
+        assert!(configuration_is_collision_free(&model, &gm, &[0.0, 0.0], Some(&acm)));
+
+        // Without ACM: the adjacent collision is reported
+        assert!(!configuration_is_collision_free(&model, &gm, &[0.0, 0.0], None));
     }
 }
