@@ -8,6 +8,8 @@
 use crate::fk::forward_kinematics;
 use crate::frames::{compute_frame_jacobian, compute_frame_placement, Frame};
 use crate::jacobian::compute_joint_jacobian;
+use crate::limits;
+use crate::limits::JointLimits;
 use crate::manifold;
 use crate::model::Model;
 use crate::se3;
@@ -30,6 +32,7 @@ pub struct IkConfig {
     pub tol_step: f64,
     pub step_size: f64,
     pub damping: Damping,
+    pub joint_limits: Option<JointLimits>,
 }
 
 impl Default for IkConfig {
@@ -40,6 +43,7 @@ impl Default for IkConfig {
             tol_step: 1e-8,
             step_size: 1.0,
             damping: Damping::Fixed(1e-2),
+            joint_limits: None,
         }
     }
 }
@@ -106,6 +110,9 @@ fn solve_iterative(
     mut error_and_jacobian: impl FnMut(&[f64]) -> (DVector<f64>, DMatrix<f64>),
 ) -> IkResult {
     let mut q = manifold::normalize_configuration(model, q0);
+    if let Some(lim) = &config.joint_limits {
+        q = limits::clamp_configuration(model, &q, lim);
+    }
     let mut last_error = f64::INFINITY;
 
     for iter in 0..config.max_iters {
@@ -132,12 +139,20 @@ fn solve_iterative(
         };
 
         dq *= config.step_size;
+        if let Some(lim) = &config.joint_limits {
+            let dq_sat = limits::saturate_velocity(model, dq.as_slice(), lim);
+            dq = DVector::from_vec(dq_sat);
+        }
+
         let step_norm = dq.norm();
         if step_norm <= config.tol_step {
             break;
         }
 
         q = manifold::integrate(model, &q, dq.as_slice(), 1.0);
+        if let Some(lim) = &config.joint_limits {
+            q = limits::clamp_configuration(model, &q, lim);
+        }
     }
 
     IkResult {
@@ -264,6 +279,7 @@ pub fn solve_joint_position_orientation_ik(
 mod tests {
     use super::*;
     use crate::joint;
+    use crate::limits::JointLimits;
     use crate::model::{LinkInertia, ModelBuilder};
     use crate::se3;
     use approx::assert_relative_eq;
@@ -299,6 +315,7 @@ mod tests {
             tol_step: 1e-10,
             step_size: 0.8,
             damping: Damping::Fixed(1e-3),
+            joint_limits: None,
         };
 
         let result = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
@@ -384,5 +401,28 @@ mod tests {
 
         let result = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
         assert_eq!(result.status, IkStatus::MaxIterations);
+    }
+
+    #[test]
+    fn ik_respects_joint_limits() {
+        let model = two_link_planar();
+        let q0 = vec![0.0, 0.0];
+        let target = Vector3::new(0.0, 1.0, 0.0);
+
+        let mut limits = JointLimits::unbounded(&model);
+        // Lock first joint near zero; solver should not violate this bound.
+        limits.q_min[0] = -0.1;
+        limits.q_max[0] = 0.1;
+        limits.v_max[0] = 0.05;
+
+        let cfg = IkConfig {
+            max_iters: 150,
+            joint_limits: Some(limits.clone()),
+            ..IkConfig::default()
+        };
+
+        let result = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
+        assert!(result.q[0] >= limits.q_min[0] - 1e-12);
+        assert!(result.q[0] <= limits.q_max[0] + 1e-12);
     }
 }
