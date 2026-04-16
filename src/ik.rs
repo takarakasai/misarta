@@ -103,6 +103,33 @@ fn dls_step(j: &DMatrix<f64>, e: &DVector<f64>, damping: &Damping) -> Option<DVe
     Some(j.transpose() * y)
 }
 
+fn dls_pseudoinverse(j: &DMatrix<f64>, damping: &Damping) -> Option<DMatrix<f64>> {
+    let lambda = lambda_from_jacobian(j, damping);
+    let m = j.nrows();
+    let a = j * j.transpose() + DMatrix::<f64>::identity(m, m) * (lambda * lambda);
+    let a_inv = a.lu().solve(&DMatrix::<f64>::identity(m, m))?;
+    Some(j.transpose() * a_inv)
+}
+
+fn apply_step_with_limits(
+    model: &Model<f64>,
+    mut q: Vec<f64>,
+    mut dq: DVector<f64>,
+    config: &IkConfig,
+) -> (Vec<f64>, DVector<f64>) {
+    dq *= config.step_size;
+    if let Some(lim) = &config.joint_limits {
+        let dq_sat = limits::saturate_velocity(model, dq.as_slice(), lim);
+        dq = DVector::from_vec(dq_sat);
+    }
+
+    q = manifold::integrate(model, &q, dq.as_slice(), 1.0);
+    if let Some(lim) = &config.joint_limits {
+        q = limits::clamp_configuration(model, &q, lim);
+    }
+    (q, dq)
+}
+
 fn solve_iterative(
     model: &Model<f64>,
     q0: &[f64],
@@ -275,6 +302,178 @@ pub fn solve_joint_position_orientation_ik(
     })
 }
 
+/// Joint-position IK with null-space posture regularization.
+///
+/// Primary task: reach `target_position_world` at `joint_idx`.
+/// Secondary task (projected in null-space): move toward `q_posture_target`.
+pub fn solve_joint_position_ik_with_posture(
+    model: &Model<f64>,
+    q0: &[f64],
+    joint_idx: usize,
+    target_position_world: Vector3<f64>,
+    q_posture_target: &[f64],
+    posture_gain: f64,
+    config: &IkConfig,
+) -> IkResult {
+    assert_eq!(q_posture_target.len(), model.nq);
+
+    let mut q = manifold::normalize_configuration(model, q0);
+    if let Some(lim) = &config.joint_limits {
+        q = limits::clamp_configuration(model, &q, lim);
+    }
+    let mut last_error = f64::INFINITY;
+
+    for iter in 0..config.max_iters {
+        let data = forward_kinematics(model, &q);
+        let current = se3::translation(&data.oMi[joint_idx]);
+        let e_vec = target_position_world - current;
+        let e = DVector::from_vec(vec![e_vec[0], e_vec[1], e_vec[2]]);
+        let e_norm = e.norm();
+        last_error = e_norm;
+
+        if e_norm <= config.tol_error {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: e_norm,
+                status: IkStatus::Converged,
+            };
+        }
+
+        let j_full = compute_joint_jacobian(model, &q, joint_idx);
+        let j = j_full.rows(3, 3).into_owned();
+
+        let Some(dq_primary) = dls_step(&j, &e, &config.damping) else {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: e_norm,
+                status: IkStatus::NumericalFailure,
+            };
+        };
+
+        let Some(j_pinv) = dls_pseudoinverse(&j, &config.damping) else {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: e_norm,
+                status: IkStatus::NumericalFailure,
+            };
+        };
+
+        let n = DMatrix::<f64>::identity(model.nv, model.nv) - (&j_pinv * &j);
+
+        let posture_err = DVector::from_vec(manifold::difference(model, &q, q_posture_target));
+        let dq_secondary = n * (posture_err * posture_gain);
+        let dq = dq_primary + dq_secondary;
+
+        let step_norm = dq.norm();
+        if step_norm <= config.tol_step {
+            break;
+        }
+
+        let (q_new, _) = apply_step_with_limits(model, q, dq, config);
+        q = q_new;
+    }
+
+    IkResult {
+        q,
+        iterations: config.max_iters,
+        final_error_norm: last_error,
+        status: IkStatus::MaxIterations,
+    }
+}
+
+/// Prioritized two-task IK (strict hierarchy).
+///
+/// - Primary task: position of `primary_joint_idx`
+/// - Secondary task: position of `secondary_joint_idx` in null-space of primary
+pub fn solve_two_task_position_ik(
+    model: &Model<f64>,
+    q0: &[f64],
+    primary_joint_idx: usize,
+    primary_target_world: Vector3<f64>,
+    secondary_joint_idx: usize,
+    secondary_target_world: Vector3<f64>,
+    secondary_weight: f64,
+    config: &IkConfig,
+) -> IkResult {
+    let mut q = manifold::normalize_configuration(model, q0);
+    if let Some(lim) = &config.joint_limits {
+        q = limits::clamp_configuration(model, &q, lim);
+    }
+    let mut last_error = f64::INFINITY;
+
+    for iter in 0..config.max_iters {
+        let data = forward_kinematics(model, &q);
+
+        let p1 = se3::translation(&data.oMi[primary_joint_idx]);
+        let e1_vec = primary_target_world - p1;
+        let e1 = DVector::from_vec(vec![e1_vec[0], e1_vec[1], e1_vec[2]]);
+        let e1_norm = e1.norm();
+
+        let p2 = se3::translation(&data.oMi[secondary_joint_idx]);
+        let e2_vec = (secondary_target_world - p2) * secondary_weight;
+        let e2 = DVector::from_vec(vec![e2_vec[0], e2_vec[1], e2_vec[2]]);
+
+        last_error = (e1_norm * e1_norm + e2.norm_squared()).sqrt();
+
+        if e1_norm <= config.tol_error {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: last_error,
+                status: IkStatus::Converged,
+            };
+        }
+
+        let j1_full = compute_joint_jacobian(model, &q, primary_joint_idx);
+        let j2_full = compute_joint_jacobian(model, &q, secondary_joint_idx);
+        let j1 = j1_full.rows(3, 3).into_owned();
+        let j2 = j2_full.rows(3, 3).into_owned() * secondary_weight;
+
+        let Some(dq1) = dls_step(&j1, &e1, &config.damping) else {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: last_error,
+                status: IkStatus::NumericalFailure,
+            };
+        };
+
+        let Some(j1_pinv) = dls_pseudoinverse(&j1, &config.damping) else {
+            return IkResult {
+                q,
+                iterations: iter,
+                final_error_norm: last_error,
+                status: IkStatus::NumericalFailure,
+            };
+        };
+        let n = DMatrix::<f64>::identity(model.nv, model.nv) - (&j1_pinv * &j1);
+
+        // Secondary task in null-space: J2 N dq2 = e2 - J2 dq1
+        let j2n = &j2 * &n;
+        let rhs2 = e2 - (&j2 * &dq1);
+        let dq2 = dls_step(&j2n, &rhs2, &config.damping).unwrap_or_else(|| DVector::zeros(model.nv));
+
+        let dq = dq1 + &n * dq2;
+        let step_norm = dq.norm();
+        if step_norm <= config.tol_step {
+            break;
+        }
+
+        let (q_new, _) = apply_step_with_limits(model, q, dq, config);
+        q = q_new;
+    }
+
+    IkResult {
+        q,
+        iterations: config.max_iters,
+        final_error_norm: last_error,
+        status: IkStatus::MaxIterations,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +623,60 @@ mod tests {
         let result = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
         assert!(result.q[0] >= limits.q_min[0] - 1e-12);
         assert!(result.q[0] <= limits.q_max[0] + 1e-12);
+    }
+
+    #[test]
+    fn nullspace_posture_bias_moves_toward_reference() {
+        let model = two_link_planar();
+        let q0 = vec![0.0, 0.0];
+        let target = Vector3::new(1.5, 0.0, 0.0);
+        let q_ref = vec![0.0, 1.0];
+
+        let cfg = IkConfig {
+            max_iters: 120,
+            step_size: 0.8,
+            damping: Damping::Fixed(1e-3),
+            ..IkConfig::default()
+        };
+
+        let no_bias = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
+        let with_bias = solve_joint_position_ik_with_posture(&model, &q0, 2, target, &q_ref, 0.15, &cfg);
+
+        let d_no = (no_bias.q[1] - q_ref[1]).abs();
+        let d_yes = (with_bias.q[1] - q_ref[1]).abs();
+        assert!(d_yes < d_no);
+    }
+
+    #[test]
+    fn prioritized_two_task_keeps_primary_accuracy() {
+        let model = two_link_planar();
+        let q0 = vec![0.2, -0.4];
+
+        let primary_target = Vector3::new(0.8, 0.6, 0.0);
+        let secondary_target = Vector3::new(0.4, 0.7, 0.0);
+
+        let cfg = IkConfig {
+            max_iters: 180,
+            step_size: 0.8,
+            damping: Damping::Fixed(1e-3),
+            ..IkConfig::default()
+        };
+
+        let res = solve_two_task_position_ik(
+            &model,
+            &q0,
+            2,
+            primary_target,
+            1,
+            secondary_target,
+            0.5,
+            &cfg,
+        );
+
+        // Primary task must remain accurate.
+        let data = forward_kinematics(&model, &res.q);
+        let p_primary = se3::translation(&data.oMi[2]);
+        assert_relative_eq!(p_primary[0], primary_target[0], epsilon = 1e-3);
+        assert_relative_eq!(p_primary[1], primary_target[1], epsilon = 1e-3);
     }
 }
