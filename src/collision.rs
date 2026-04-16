@@ -6,6 +6,25 @@
 use crate::fk::forward_kinematics;
 use crate::geometry::{GeometryModel, GeometryShape};
 use crate::model::Model;
+
+/// Returns `true` if the two joint indices are the same or are direct parent–child.
+///
+/// This is used to skip geometry pairs whose links are physically connected
+/// and thus always interpenetrate at the joint.
+fn are_adjacent_joints(model: &Model<f64>, a: usize, b: usize) -> bool {
+    if a == b {
+        return true;
+    }
+    // a is direct parent of b
+    if b < model.joints.len() && model.joints[b].parent == a {
+        return true;
+    }
+    // b is direct parent of a
+    if a < model.joints.len() && model.joints[a].parent == b {
+        return true;
+    }
+    false
+}
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use parry3d::query;
 use parry3d::shape::{Ball, Capsule, Cone, Cuboid, Cylinder, SharedShape};
@@ -98,11 +117,16 @@ fn build_collision_objects(
     objects
 }
 
+/// Return all colliding geometry object index pairs.
+///
+/// `ignore_adjacent_links` — when `true`, skips pairs whose parent joints are
+/// the same joint **or** are directly connected (parent–child). This prevents
+/// false positives from geometries that are physically touching at a joint.
 pub fn collision_pairs(
     model: &Model<f64>,
     gmodel: &GeometryModel,
     q: &[f64],
-    ignore_same_parent_joint: bool,
+    ignore_adjacent_links: bool,
 ) -> Vec<CollisionPair> {
     let objects = build_collision_objects(model, gmodel, q);
     let mut out = Vec::new();
@@ -112,7 +136,7 @@ pub fn collision_pairs(
             let a = &objects[i];
             let b = &objects[j];
 
-            if ignore_same_parent_joint && a.parent_joint == b.parent_joint {
+            if ignore_adjacent_links && are_adjacent_joints(model, a.parent_joint, b.parent_joint) {
                 continue;
             }
 
@@ -129,20 +153,23 @@ pub fn collision_pairs(
     out
 }
 
+/// Returns `true` if any two non-adjacent geometry objects overlap.
 pub fn has_collision(
     model: &Model<f64>,
     gmodel: &GeometryModel,
     q: &[f64],
-    ignore_same_parent_joint: bool,
+    ignore_adjacent_links: bool,
 ) -> bool {
-    !collision_pairs(model, gmodel, q, ignore_same_parent_joint).is_empty()
+    !collision_pairs(model, gmodel, q, ignore_adjacent_links).is_empty()
 }
 
+/// Return the minimum separation distance between any two non-adjacent geometry pairs.
+/// Returns `None` if there are fewer than two comparable objects.
 pub fn minimum_distance(
     model: &Model<f64>,
     gmodel: &GeometryModel,
     q: &[f64],
-    ignore_same_parent_joint: bool,
+    ignore_adjacent_links: bool,
 ) -> Option<f64> {
     let objects = build_collision_objects(model, gmodel, q);
     let mut min_d: Option<f64> = None;
@@ -152,7 +179,7 @@ pub fn minimum_distance(
             let a = &objects[i];
             let b = &objects[j];
 
-            if ignore_same_parent_joint && a.parent_joint == b.parent_joint {
+            if ignore_adjacent_links && are_adjacent_joints(model, a.parent_joint, b.parent_joint) {
                 continue;
             }
 
@@ -287,8 +314,9 @@ mod tests {
         assert_relative_eq!(d, 0.5, epsilon = 1e-9);
     }
 
+    /// Same joint index → always adjacent, excluded when flag is set.
     #[test]
-    fn ignore_same_parent_joint_works() {
+    fn ignore_adjacent_excludes_same_joint() {
         let model = two_joint_model();
         let mut gm = GeometryModel::new();
 
@@ -300,7 +328,6 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
         });
-
         gm.add(GeometryObject {
             name: "b".into(),
             parent_joint: 1,
@@ -313,5 +340,80 @@ mod tests {
         let q = vec![0.0];
         assert!(has_collision(&model, &gm, &q, false));
         assert!(!has_collision(&model, &gm, &q, true));
+    }
+
+    /// Parent joint (1) and child joint (2) are adjacent → excluded even though
+    /// the spheres overlap, because the links are physically connected.
+    #[test]
+    fn ignore_adjacent_excludes_parent_child_joint() {
+        // Spheres on joint 1 and joint 2; joint 2's parent is joint 1.
+        // With ignore=false the overlap is reported; with ignore=true it is skipped.
+        let model = two_joint_model();
+        let mut gm = GeometryModel::new();
+
+        gm.add(GeometryObject {
+            name: "link1_geom".into(),
+            parent_joint: 1,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 1.0 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "link2_geom".into(),
+            parent_joint: 2,
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 1.0 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let q = vec![0.0];
+        // Centers are 1.5 m apart, each radius 1.0 m → overlap, reported without filter
+        assert!(has_collision(&model, &gm, &q, false));
+        // Parent–child pair → excluded with filter
+        assert!(!has_collision(&model, &gm, &q, true));
+    }
+
+    /// Non-adjacent joints (e.g. joints 1 and 2 when a 3rd joint exists between
+    /// them and the target) are NOT excluded even with the flag set.
+    #[test]
+    fn non_adjacent_joints_still_detected() {
+        // 3-link chain: j1 → j2 → j3. Geometries on j1 and j3 are not adjacent.
+        let model = ModelBuilder::new()
+            .add_joint("j1", 0, joint::revolute_z(), se3::identity(), LinkInertia::zero())
+            .add_joint(
+                "j2", 1, JointType::Fixed,
+                se3::from_rotation_and_translation(&Rotation3::identity(), &Vector3::new(0.5, 0.0, 0.0)),
+                LinkInertia::zero(),
+            )
+            .add_joint(
+                "j3", 2, JointType::Fixed,
+                se3::from_rotation_and_translation(&Rotation3::identity(), &Vector3::new(0.5, 0.0, 0.0)),
+                LinkInertia::zero(),
+            )
+            .build();
+
+        let mut gm = GeometryModel::new();
+        gm.add(GeometryObject {
+            name: "a".into(),
+            parent_joint: 1,  // j1
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.8 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+        gm.add(GeometryObject {
+            name: "b".into(),
+            parent_joint: 3,  // j3, 1.0 m from j1 center, radius sum 1.6 → overlap
+            placement: se3::identity(),
+            shape: GeometryShape::Sphere { radius: 0.8 },
+            mesh_path: None,
+            mesh_scale: None,
+        });
+
+        let q = vec![0.0];
+        // j1 and j3 are NOT direct parent-child → still reported even with flag
+        assert!(has_collision(&model, &gm, &q, true));
     }
 }
