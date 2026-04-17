@@ -9,7 +9,7 @@
 
 use crate::model::Model;
 use crate::se3;
-use nalgebra::{DVector, Matrix6, RealField, Vector3, Vector6};
+use nalgebra::{DMatrix, DVector, Matrix6, RealField, Vector3, Vector6};
 
 /// Compute forward dynamics via the Articulated Body Algorithm.
 ///
@@ -340,6 +340,49 @@ pub fn aba<T: RealField>(
     qdd
 }
 
+/// Compute M(q)⁻¹ τ using O(n) ABA forward dynamics.
+///
+/// Equivalent to solving `M(q) x = τ` for `x` without forming M.
+/// This is the preferred way to apply the inverse mass matrix to a single
+/// vector, as it avoids the O(n²) CRBA + O(n³) factorization path.
+///
+/// Uses ABA with zero velocity and zero gravity to isolate the `M⁻¹ τ` term.
+pub fn compute_minv_times_vec<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    tau: &[T],
+) -> DVector<T> {
+    // M⁻¹ τ = aba(model_no_gravity, q, 0, τ)
+    // We temporarily override gravity by using a zero-velocity, zero-gravity call.
+    let mut model_no_g = model.clone();
+    model_no_g.gravity = Vector3::zeros();
+    let v_zero = vec![T::zero(); model.nv];
+    aba(&model_no_g, q, &v_zero, tau)
+}
+
+/// Compute the full inverse mass matrix M(q)⁻¹ as an nv×nv matrix.
+///
+/// Uses `compute_minv_times_vec` for each column (unit vector).
+/// Overall complexity is O(n²·nv) which equals O(n³), but each column
+/// benefits from the O(n) ABA structure rather than dense factorization.
+///
+/// For applying M⁻¹ to a single vector, prefer [`compute_minv_times_vec`].
+pub fn compute_minv(model: &Model<f64>, q: &[f64]) -> DMatrix<f64> {
+    let nv = model.nv;
+    let mut minv = DMatrix::zeros(nv, nv);
+
+    for col in 0..nv {
+        let mut e_col = vec![0.0; nv];
+        e_col[col] = 1.0;
+        let col_vec = compute_minv_times_vec(model, q, &e_col);
+        for row in 0..nv {
+            minv[(row, col)] = col_vec[row];
+        }
+    }
+
+    minv
+}
+
 /// Transform a 6×6 spatial inertia from child frame to parent frame.
 fn transform_spatial_inertia_6x6<T: RealField>(
     ic: &Matrix6<T>,
@@ -491,5 +534,44 @@ mod tests {
         let qdd = aba(&model, &q, &v, &tau);
         // Should get -9.81 (falling in -Z)
         assert_relative_eq!(qdd[0], -9.81, epsilon = 1e-8);
+    }
+
+    #[test]
+    fn minv_times_vec_matches_crba_inverse() {
+        // M⁻¹ τ computed via ABA should match M⁻¹ τ computed via CRBA + LU.
+        let model = two_link_arm();
+        let q = vec![0.3, -0.5];
+        let tau = vec![5.0, -2.0];
+
+        let result_aba = compute_minv_times_vec(&model, &q, &tau);
+
+        let m = crba(&model, &q);
+        let m_lu = m.lu();
+        let tau_vec = DVector::from_column_slice(&tau);
+        let result_crba = m_lu.solve(&tau_vec).unwrap();
+
+        assert_relative_eq!(result_aba, result_crba, epsilon = 1e-8);
+    }
+
+    #[test]
+    fn compute_minv_matches_crba_inverse() {
+        // Full M⁻¹ should satisfy M * M⁻¹ = I.
+        let model = two_link_arm();
+        let q = vec![0.3, -0.5];
+
+        let m = crba(&model, &q);
+        let minv = compute_minv(&model, &q);
+
+        let product = &m * &minv;
+        let eye = DMatrix::identity(model.nv, model.nv);
+        assert_relative_eq!(product, eye, epsilon = 1e-8);
+    }
+
+    #[test]
+    fn minv_is_symmetric() {
+        let model = two_link_arm();
+        let q = vec![0.3, -0.5];
+        let minv = compute_minv(&model, &q);
+        assert_relative_eq!(minv.clone(), minv.transpose(), epsilon = 1e-10);
     }
 }

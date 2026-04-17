@@ -10,6 +10,7 @@
 use crate::aba::aba;
 use crate::fk::forward_kinematics;
 use crate::jacobian::compute_joint_jacobian;
+use crate::limits::{self, JointLimits};
 use crate::manifold;
 use crate::model::Model;
 use crate::se3;
@@ -94,6 +95,8 @@ pub struct IlqrConfig {
     pub u_min: Option<Vec<f64>>,
     /// Optional upper bounds for control input (size nv).
     pub u_max: Option<Vec<f64>>,
+    /// Optional state limits projected during rollout.
+    pub joint_limits: Option<JointLimits>,
 }
 
 impl Default for IlqrConfig {
@@ -107,6 +110,7 @@ impl Default for IlqrConfig {
             alphas: vec![1.0, 0.5, 0.25, 0.1, 0.05, 0.01],
             u_min: None,
             u_max: None,
+            joint_limits: None,
         }
     }
 }
@@ -128,17 +132,30 @@ fn rollout_controls(
     v0: &[f64],
     u_seq: &[Vec<f64>],
     dt: f64,
+    joint_limits: Option<&JointLimits>,
 ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
     let n = u_seq.len();
     let mut q_seq = Vec::with_capacity(n + 1);
     let mut v_seq = Vec::with_capacity(n + 1);
-    q_seq.push(q0.to_vec());
-    v_seq.push(v0.to_vec());
+
+    let mut q_init = q0.to_vec();
+    let mut v_init = v0.to_vec();
+    if let Some(lim) = joint_limits {
+        q_init = limits::clamp_configuration(model, &q_init, lim);
+        v_init = limits::saturate_velocity(model, &v_init, lim);
+    }
+
+    q_seq.push(q_init);
+    v_seq.push(v_init);
 
     for k in 0..n {
         assert_eq!(u_seq[k].len(), model.nv);
-        let (q_next, v_next) =
+        let (mut q_next, mut v_next) =
             discrete_dynamics_step(model, &q_seq[k], &v_seq[k], &u_seq[k], dt);
+        if let Some(lim) = joint_limits {
+            q_next = limits::clamp_configuration(model, &q_next, lim);
+            v_next = limits::saturate_velocity(model, &v_next, lim);
+        }
         q_seq.push(q_next);
         v_seq.push(v_next);
     }
@@ -248,6 +265,9 @@ pub fn solve_ilqr(
             assert!(u_min[i] <= u_max[i], "u_min[{}] > u_max[{}]", i, i);
         }
     }
+    if let Some(lim) = &config.joint_limits {
+        lim.validate(model);
+    }
 
     let mut u_seq = u_init.to_vec();
     for u in &mut u_seq {
@@ -259,7 +279,7 @@ pub fn solve_ilqr(
         );
     }
 
-    let (mut q_seq, mut v_seq) = rollout_controls(model, q0, v0, &u_seq, dt);
+    let (mut q_seq, mut v_seq) = rollout_controls(model, q0, v0, &u_seq, dt, config.joint_limits.as_ref());
     let mut cost = evaluate_trajectory_cost(
         model,
         &q_seq,
@@ -374,8 +394,12 @@ pub fn solve_ilqr(
                     config.u_max.as_deref(),
                 );
 
-                let (q_next, v_next) =
+                let (mut q_next, mut v_next) =
                     discrete_dynamics_step(model, &cand_q[k], &cand_v[k], &cand_u[k], dt);
+                if let Some(lim) = config.joint_limits.as_ref() {
+                    q_next = limits::clamp_configuration(model, &q_next, lim);
+                    v_next = limits::saturate_velocity(model, &v_next, lim);
+                }
                 cand_q.push(q_next);
                 cand_v.push(v_next);
 
@@ -826,6 +850,7 @@ pub fn linearize_discrete_dynamics(
 mod tests {
     use super::*;
     use crate::joint;
+    use crate::limits::JointLimits;
     use crate::model::{LinkInertia, ModelBuilder};
     use crate::se3;
     use approx::assert_relative_eq;
@@ -1302,6 +1327,58 @@ mod tests {
         for uk in &result.u_seq {
             assert!(uk[0] >= -0.05 - 1e-12);
             assert!(uk[0] <= 0.05 + 1e-12);
+        }
+    }
+
+    #[test]
+    fn ilqr_respects_state_limits_projection() {
+        let model = simple_revolute_model();
+        let q0 = vec![0.6];
+        let v0 = vec![0.5];
+        let n = 15usize;
+
+        let u_init = vec![vec![0.2]; n];
+        let q_ref_seq = vec![vec![0.0]; n + 1];
+        let v_ref_seq = vec![vec![0.0]; n + 1];
+        let u_ref_seq = vec![vec![0.0]; n];
+
+        let q_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![30.0, 2.0]));
+        let r_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![0.02]));
+        let qf_weight = DMatrix::<f64>::from_diagonal(&DVector::from_vec(vec![60.0, 3.0]));
+
+        let mut lim = JointLimits::unbounded(&model);
+        lim.q_min[0] = -0.1;
+        lim.q_max[0] = 0.1;
+        lim.v_max[0] = 0.03;
+
+        let cfg = IlqrConfig {
+            max_iters: 8,
+            joint_limits: Some(lim.clone()),
+            ..IlqrConfig::default()
+        };
+
+        let result = solve_ilqr(
+            &model,
+            &q0,
+            &v0,
+            &u_init,
+            &q_ref_seq,
+            &v_ref_seq,
+            &u_ref_seq,
+            &q_weight,
+            &r_weight,
+            &qf_weight,
+            0.02,
+            1e-6,
+            &cfg,
+        );
+
+        for q in &result.q_seq {
+            assert!(q[0] >= lim.q_min[0] - 1e-12);
+            assert!(q[0] <= lim.q_max[0] + 1e-12);
+        }
+        for v in &result.v_seq {
+            assert!(v[0].abs() <= lim.v_max[0] + 1e-12);
         }
     }
 }

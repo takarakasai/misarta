@@ -7,7 +7,7 @@
 
 use crate::model::Model;
 use crate::se3::{self, SE3};
-use nalgebra::{DMatrix, RealField};
+use nalgebra::{DMatrix, RealField, Vector6};
 
 /// Stores the results of kinematic/dynamic computations.
 ///
@@ -21,6 +21,12 @@ pub struct Data<T: RealField> {
     pub oMi: Vec<SE3<T>>,
     /// Body-frame Jacobians (6×nv), one per joint (only populated by `jacobian`).
     pub J: DMatrix<T>,
+    /// Body-frame spatial velocity [ω; v] for each joint.
+    /// Populated by `forward_kinematics_velocity` and `forward_kinematics_acceleration`.
+    pub v: Vec<Vector6<T>>,
+    /// Body-frame spatial acceleration [α; a] for each joint.
+    /// Populated by `forward_kinematics_acceleration`.
+    pub a: Vec<Vector6<T>>,
 }
 
 impl<T: RealField> Data<T> {
@@ -31,6 +37,8 @@ impl<T: RealField> Data<T> {
             joint_placements: vec![se3::identity(); n],
             oMi: vec![se3::identity(); n],
             J: DMatrix::zeros(6, model.nv),
+            v: vec![Vector6::zeros(); n],
+            a: vec![Vector6::zeros(); n],
         }
     }
 }

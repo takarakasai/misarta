@@ -262,6 +262,109 @@ fn q_slice<'a, T: RealField>(model: &Model<T>, q: &'a [T], i: usize) -> &'a [T] 
     &q[qi..qi + model.joints[i].joint_type.nq()]
 }
 
+// ─── Local-frame (body-frame) Jacobian ──────────────────────────────────────
+
+/// Compute the body-frame (local) geometric Jacobian for a specific joint.
+///
+/// Returns a 6×nv matrix where spatial velocities are expressed in the
+/// frame of `joint_idx` rather than the world frame.
+///
+/// Equivalent to `pinocchio::computeJointJacobian` with `LOCAL` reference frame.
+///
+/// Relationship: `J_local = Ad_{oMi[i]}^{-1} * J_world`, applied column-wise as
+/// a rotation of both angular and linear parts.
+pub fn compute_joint_jacobian_local<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    joint_idx: usize,
+) -> DMatrix<T> {
+    let data = forward_kinematics(model, q);
+    compute_joint_jacobian_local_from_data(model, q, &data, joint_idx)
+}
+
+/// Same as [`compute_joint_jacobian_local`] but takes pre-computed FK data.
+pub fn compute_joint_jacobian_local_from_data<T: RealField>(
+    model: &Model<T>,
+    q: &[T],
+    data: &Data<T>,
+    joint_idx: usize,
+) -> DMatrix<T> {
+    let j_world = compute_joint_jacobian_from_data(model, q, data, joint_idx);
+    let r = se3::rotation_matrix(&data.oMi[joint_idx]);
+    let rt = r.transpose();
+    let p = se3::translation(&data.oMi[joint_idx]);
+
+    let mut j_local = DMatrix::zeros(6, model.nv);
+    for c in 0..model.nv {
+        let w = Vector3::new(
+            j_world[(0, c)].clone(),
+            j_world[(1, c)].clone(),
+            j_world[(2, c)].clone(),
+        );
+        let v = Vector3::new(
+            j_world[(3, c)].clone(),
+            j_world[(4, c)].clone(),
+            j_world[(5, c)].clone(),
+        );
+        // Rotate to local frame:
+        // ω_local = R^T ω_world
+        // v_local = R^T (v_world − p × ω_world)
+        let w_local = &rt * &w;
+        let v_local = &rt * (v - p.cross(&w));
+        j_local[(0, c)] = w_local[0].clone();
+        j_local[(1, c)] = w_local[1].clone();
+        j_local[(2, c)] = w_local[2].clone();
+        j_local[(3, c)] = v_local[0].clone();
+        j_local[(4, c)] = v_local[1].clone();
+        j_local[(5, c)] = v_local[2].clone();
+    }
+    j_local
+}
+
+// ─── Jacobian time derivative ───────────────────────────────────────────────
+
+/// Compute the time derivative of the world-frame geometric Jacobian: dJ/dt.
+///
+/// Returns a 6×nv matrix such that the spatial acceleration contribution
+/// from the changing Jacobian is `dJ/dt * v`.
+///
+/// This is computed via central finite differences of the Jacobian with
+/// respect to configuration, weighted by the velocity:
+///
+/// `Ȧ ≈ Σ_k  v_k * (J(q + ε e_k) − J(q − ε e_k)) / (2ε)`
+///
+/// Equivalent to `pinocchio::computeJointJacobiansTimeVariation`.
+pub fn compute_joint_jacobian_time_derivative(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+    joint_idx: usize,
+) -> DMatrix<f64> {
+    assert_eq!(q.len(), model.nq);
+    assert_eq!(v.len(), model.nv);
+    assert!(joint_idx > 0 && joint_idx < model.joints.len());
+
+    let eps = 1e-8;
+    let mut dj = DMatrix::zeros(6, model.nv);
+
+    for k in 0..model.nv {
+        if v[k].abs() < 1e-30 {
+            continue;
+        }
+        let mut q_plus = q.to_vec();
+        let mut q_minus = q.to_vec();
+        q_plus[k] += eps;
+        q_minus[k] -= eps;
+
+        let j_plus = compute_joint_jacobian(model, &q_plus, joint_idx);
+        let j_minus = compute_joint_jacobian(model, &q_minus, joint_idx);
+        let dj_dqk = (&j_plus - &j_minus) / (2.0 * eps);
+        dj += v[k] * dj_dqk;
+    }
+
+    dj
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -567,5 +670,96 @@ mod tests {
         assert_relative_eq!(jac[(3, j)], dp[0], epsilon = 1e-4);
         assert_relative_eq!(jac[(4, j)], dp[1], epsilon = 1e-4);
         assert_relative_eq!(jac[(5, j)], dp[2], epsilon = 1e-4);
+    }
+
+    // ── Local-frame Jacobian tests ──────────────────────────────────────
+
+    #[test]
+    fn local_jacobian_zero_config_matches_world() {
+        // At zero config of a revolute-Z at origin, body frame = world frame.
+        // So J_local should equal J_world.
+        let model = ModelBuilder::new()
+            .add_joint(
+                "j1", 0, joint::revolute_z(), se3::identity(), LinkInertia::zero(),
+            )
+            .build();
+        let q = vec![0.0];
+        let j_world = compute_joint_jacobian(&model, &q, 1);
+        let j_local = compute_joint_jacobian_local(&model, &q, 1);
+        assert_relative_eq!(j_world, j_local, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn local_jacobian_rotation_invariance() {
+        // The body-frame angular Jacobian column for the own joint's revolute axis
+        // should always be [0,0,1,0,0,0] regardless of configuration, since the
+        // motion subspace is constant in the body frame.
+        let model = ModelBuilder::new()
+            .add_joint(
+                "j1", 0, joint::revolute_z(), se3::identity(), LinkInertia::zero(),
+            )
+            .build();
+        for &angle in &[0.0, 0.7, -1.3, std::f64::consts::PI] {
+            let q = vec![angle];
+            let j_local = compute_joint_jacobian_local(&model, &q, 1);
+            // Angular part of column 0 should be [0, 0, 1]
+            assert_relative_eq!(j_local[(0, 0)], 0.0, epsilon = 1e-12);
+            assert_relative_eq!(j_local[(1, 0)], 0.0, epsilon = 1e-12);
+            assert_relative_eq!(j_local[(2, 0)], 1.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn local_jacobian_transform_consistency() {
+        // J_local * v should give body-frame velocity, which should match
+        // R^T * J_world * v for the angular part.
+        let model = two_link_arm();
+        let q = vec![0.5, -0.3];
+        let v = nalgebra::DVector::from_column_slice(&[1.0, -0.5]);
+
+        let data = crate::fk::forward_kinematics(&model, &q);
+        let j_world = compute_joint_jacobian_from_data(&model, &q, &data, 2);
+        let j_local = compute_joint_jacobian_local_from_data(&model, &q, &data, 2);
+
+        let vel_world = &j_world * &v;
+        let vel_local = &j_local * &v;
+
+        // R^T * vel_world_angular should == vel_local_angular
+        let r = se3::rotation_matrix(&data.oMi[2]);
+        let rt = r.transpose();
+        let w_world = Vector3::new(vel_world[0], vel_world[1], vel_world[2]);
+        let w_local_expected = &rt * w_world;
+        assert_relative_eq!(vel_local[0], w_local_expected[0], epsilon = 1e-10);
+        assert_relative_eq!(vel_local[1], w_local_expected[1], epsilon = 1e-10);
+        assert_relative_eq!(vel_local[2], w_local_expected[2], epsilon = 1e-10);
+    }
+
+    // ── Jacobian time derivative tests ──────────────────────────────────
+
+    #[test]
+    fn dj_dt_zero_velocity_is_zero() {
+        let model = two_link_arm();
+        let q = vec![0.3, -0.5];
+        let v = vec![0.0, 0.0];
+        let dj = compute_joint_jacobian_time_derivative(&model, &q, &v, 2);
+        assert_relative_eq!(dj, DMatrix::zeros(6, 2), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn dj_dt_finite_difference_validation() {
+        // Validate dJ/dt numerically: for small dt,
+        // J(q + v*dt) ≈ J(q) + dJ/dt * dt
+        let model = two_link_arm();
+        let q = vec![0.3, -0.5];
+        let v = vec![1.0, -0.5];
+        let dj = compute_joint_jacobian_time_derivative(&model, &q, &v, 2);
+
+        let dt = 1e-6;
+        let q_fwd: Vec<f64> = q.iter().zip(v.iter()).map(|(qi, vi)| qi + vi * dt).collect();
+        let j_fwd = compute_joint_jacobian(&model, &q_fwd, 2);
+        let j_cur = compute_joint_jacobian(&model, &q, 2);
+        let dj_fd = (&j_fwd - &j_cur) / dt;
+
+        assert_relative_eq!(dj, dj_fd, epsilon = 1e-4);
     }
 }

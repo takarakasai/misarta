@@ -271,6 +271,68 @@ pub fn compute_centroidal_inertia(model: &Model<f64>, q: &[f64]) -> Matrix6<f64>
     phi
 }
 
+/// Centroidal Momentum Matrix time derivative: dA_G/dt (6×nv).
+///
+/// Returns the matrix `Ȧ_G` such that the rate of change of centroidal
+/// momentum is:
+///
+/// `ḣ = A_G q̈ + Ȧ_G q̇`
+///
+/// This is needed for momentum-rate control and centroidal dynamics.
+///
+/// Computed via central finite differences:
+///
+/// `Ȧ_G ≈ Σ_k v_k * (A_G(q + ε e_k) − A_G(q − ε e_k)) / (2ε)`
+///
+/// Equivalent to `pinocchio::dccrba` / `pinocchio::computeCentroidalMapTimeVariation`.
+pub fn compute_centroidal_momentum_matrix_time_derivative(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+) -> DMatrix<f64> {
+    assert_eq!(q.len(), model.nq);
+    assert_eq!(v.len(), model.nv);
+
+    let eps = 1e-8;
+    let nv = model.nv;
+    let mut da = DMatrix::zeros(6, nv);
+
+    for k in 0..nv {
+        if v[k].abs() < 1e-30 {
+            continue;
+        }
+        let mut q_plus = q.to_vec();
+        let mut q_minus = q.to_vec();
+        q_plus[k] += eps;
+        q_minus[k] -= eps;
+
+        let a_plus = compute_centroidal_momentum_matrix(model, &q_plus);
+        let a_minus = compute_centroidal_momentum_matrix(model, &q_minus);
+        let da_dqk = (&a_plus - &a_minus) / (2.0 * eps);
+        da += v[k] * da_dqk;
+    }
+
+    da
+}
+
+/// Centroidal momentum rate: `ḣ = A_G q̈ + Ȧ_G q̇`.
+///
+/// Computes the full time derivative of centroidal momentum given
+/// generalized velocity and acceleration.
+pub fn compute_momentum_rate(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+    a: &[f64],
+) -> Vector6<f64> {
+    let ag = compute_centroidal_momentum_matrix(model, q);
+    let dag = compute_centroidal_momentum_matrix_time_derivative(model, q, v);
+    let v_vec = DVector::from_column_slice(v);
+    let a_vec = DVector::from_column_slice(a);
+    let h_dot = ag * a_vec + dag * v_vec;
+    Vector6::new(h_dot[0], h_dot[1], h_dot[2], h_dot[3], h_dot[4], h_dot[5])
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -434,5 +496,53 @@ mod tests {
         let m = total_mass(&model);
         assert_abs_diff_eq!(h[3], m * p_dot.x, epsilon = 1e-10);
         assert_abs_diff_eq!(h[4], m * p_dot.y, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn cmm_time_derivative_zero_velocity_is_zero() {
+        let (model, q) = two_link_arm();
+        let v = vec![0.0, 0.0];
+        let da = compute_centroidal_momentum_matrix_time_derivative(&model, &q, &v);
+        assert_abs_diff_eq!(da, DMatrix::zeros(6, model.nv), epsilon = 1e-10);
+    }
+
+    #[test]
+    fn cmm_time_derivative_finite_difference() {
+        // Validate Ȧ_G via: A_G(q + v*dt) ≈ A_G(q) + Ȧ_G * dt
+        let (model, q) = two_link_arm();
+        let v = vec![1.0, -0.5];
+        let da = compute_centroidal_momentum_matrix_time_derivative(&model, &q, &v);
+
+        let dt = 1e-6;
+        let q_fwd: Vec<f64> = q.iter().zip(v.iter()).map(|(qi, vi)| qi + vi * dt).collect();
+        let a_fwd = compute_centroidal_momentum_matrix(&model, &q_fwd);
+        let a_cur = compute_centroidal_momentum_matrix(&model, &q);
+        let da_fd = (&a_fwd - &a_cur) / dt;
+
+        assert_abs_diff_eq!(da, da_fd, epsilon = 1e-4);
+    }
+
+    #[test]
+    fn momentum_rate_matches_finite_difference() {
+        // ḣ ≈ (h(q+v*dt, v+a*dt) − h(q, v)) / dt
+        let (model, q) = two_link_arm();
+        let v = vec![1.0, -0.5];
+        let a = vec![0.5, 0.2];
+        let h_dot = compute_momentum_rate(&model, &q, &v, &a);
+
+        let dt = 1e-6;
+        let q_fwd: Vec<f64> = q.iter().zip(v.iter()).map(|(qi, vi)| qi + vi * dt).collect();
+        let v_fwd: Vec<f64> = v.iter().zip(a.iter()).map(|(vi, ai)| vi + ai * dt).collect();
+
+        let h0 = compute_momentum(&model, &q, &v);
+        let h1 = compute_momentum(&model, &q_fwd, &v_fwd);
+        let h_dot_fd = (h1 - h0) / dt;
+
+        assert_abs_diff_eq!(h_dot[0], h_dot_fd[0], epsilon = 1e-3);
+        assert_abs_diff_eq!(h_dot[1], h_dot_fd[1], epsilon = 1e-3);
+        assert_abs_diff_eq!(h_dot[2], h_dot_fd[2], epsilon = 1e-3);
+        assert_abs_diff_eq!(h_dot[3], h_dot_fd[3], epsilon = 1e-3);
+        assert_abs_diff_eq!(h_dot[4], h_dot_fd[4], epsilon = 1e-3);
+        assert_abs_diff_eq!(h_dot[5], h_dot_fd[5], epsilon = 1e-3);
     }
 }
