@@ -21,3 +21,5 @@ pub mod utils;
 pub mod trajectory;
 pub mod kinematics_utils;
 pub mod constrained;
+pub mod rnea_derivatives;
+pub mod aba_derivatives;
