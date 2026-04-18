@@ -27,6 +27,56 @@ pub enum Damping {
     },
 }
 
+/// Solver method for the differential IK step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverMethod {
+    /// Damped Least Squares:  δq = W⁻¹Jᵀ(JW⁻¹Jᵀ + λ²I)⁻¹ e
+    DampedLeastSquares,
+    /// Jacobian Transpose:   δq = α·W⁻¹·Jᵀ·e,  α = eᵀJJᵀe / ‖JJᵀe‖²
+    JacobianTranspose,
+}
+
+impl Default for SolverMethod {
+    fn default() -> Self { SolverMethod::DampedLeastSquares }
+}
+
+/// Per-joint cost weights for weighted pseudo-inverse.
+///
+/// Weights are in configuration space (one per DoF).  Larger weight means
+/// the joint is "more expensive" to move and will be used less.
+///
+/// The weighted pseudo-inverse is:  J⁺_W = W⁻¹ Jᵀ (J W⁻¹ Jᵀ + λ²I)⁻¹
+#[derive(Debug, Clone)]
+pub struct JointWeights {
+    /// Weight per DoF.  Length must equal `model.nv`.
+    pub weights: Vec<f64>,
+}
+
+impl JointWeights {
+    /// Create uniform (identity) weights.
+    pub fn uniform(nv: usize) -> Self {
+        Self { weights: vec![1.0; nv] }
+    }
+
+    /// Create weights from a gradient that prefers joints near the EE.
+    ///
+    /// Given a chain of joint indices (ordered root → EE), joint `i` gets
+    /// weight `alpha^(n-1-i)`.  All other DoFs get weight `alpha^(n-1)`.
+    pub fn ee_proximal(nv: usize, chain: &[usize], alpha: f64) -> Self {
+        let n = chain.len();
+        let mut w = vec![alpha.powi(n.max(1) as i32 - 1); nv];
+        for (i, &vi) in chain.iter().enumerate() {
+            if vi < nv {
+                w[vi] = alpha.powi((n - 1 - i) as i32);
+            }
+        }
+        w
+            .iter_mut()
+            .for_each(|x| *x = x.max(1e-6));
+        Self { weights: w }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IkConfig {
     pub max_iters: usize,
@@ -35,6 +85,10 @@ pub struct IkConfig {
     pub step_size: f64,
     pub damping: Damping,
     pub joint_limits: Option<JointLimits>,
+    /// Solver method (DLS or JT).  Default: DLS.
+    pub solver_method: SolverMethod,
+    /// Per-joint cost weights.  `None` = uniform.
+    pub joint_weights: Option<JointWeights>,
 }
 
 impl Default for IkConfig {
@@ -46,6 +100,8 @@ impl Default for IkConfig {
             step_size: 1.0,
             damping: Damping::Fixed(1e-2),
             joint_limits: None,
+            solver_method: SolverMethod::DampedLeastSquares,
+            joint_weights: None,
         }
     }
 }
@@ -96,21 +152,96 @@ fn lambda_from_jacobian(j: &DMatrix<f64>, damping: &Damping) -> f64 {
     }
 }
 
-fn dls_step(j: &DMatrix<f64>, e: &DVector<f64>, damping: &Damping) -> Option<DVector<f64>> {
+fn dls_step(j: &DMatrix<f64>, e: &DVector<f64>, damping: &Damping, weights: Option<&JointWeights>) -> Option<DVector<f64>> {
     let lambda = lambda_from_jacobian(j, damping);
     let m = j.nrows();
+    let n = j.ncols();
 
-    let a = j * j.transpose() + DMatrix::<f64>::identity(m, m) * (lambda * lambda);
-    let y = a.lu().solve(e)?;
-    Some(j.transpose() * y)
+    if let Some(w) = weights {
+        // Weighted: J̃ = J · diag(1/w), then solve (J̃·Jᵀ + λ²I) y = e,
+        // then δq = diag(1/w) · Jᵀ · y
+        let mut jw = j.clone();
+        for col in 0..n {
+            let inv = 1.0 / w.weights.get(col).copied().unwrap_or(1.0).max(1e-12);
+            for row in 0..m {
+                jw[(row, col)] *= inv;
+            }
+        }
+        let a = &jw * j.transpose() + DMatrix::<f64>::identity(m, m) * (lambda * lambda);
+        let y = a.lu().solve(e)?;
+        let mut dq = j.transpose() * y;
+        for i in 0..n {
+            dq[i] *= 1.0 / w.weights.get(i).copied().unwrap_or(1.0).max(1e-12);
+        }
+        Some(dq)
+    } else {
+        let a = j * j.transpose() + DMatrix::<f64>::identity(m, m) * (lambda * lambda);
+        let y = a.lu().solve(e)?;
+        Some(j.transpose() * y)
+    }
 }
 
-fn dls_pseudoinverse(j: &DMatrix<f64>, damping: &Damping) -> Option<DMatrix<f64>> {
+fn dls_pseudoinverse(j: &DMatrix<f64>, damping: &Damping, weights: Option<&JointWeights>) -> Option<DMatrix<f64>> {
     let lambda = lambda_from_jacobian(j, damping);
     let m = j.nrows();
-    let a = j * j.transpose() + DMatrix::<f64>::identity(m, m) * (lambda * lambda);
-    let a_inv = a.lu().solve(&DMatrix::<f64>::identity(m, m))?;
-    Some(j.transpose() * a_inv)
+    let n = j.ncols();
+
+    if let Some(w) = weights {
+        let mut jw = j.clone();
+        for col in 0..n {
+            let inv = 1.0 / w.weights.get(col).copied().unwrap_or(1.0).max(1e-12);
+            for row in 0..m {
+                jw[(row, col)] *= inv;
+            }
+        }
+        let a = &jw * j.transpose() + DMatrix::<f64>::identity(m, m) * (lambda * lambda);
+        let a_inv = a.lu().solve(&DMatrix::<f64>::identity(m, m))?;
+        let mut pinv = j.transpose() * a_inv;
+        for row in 0..n {
+            let inv = 1.0 / w.weights.get(row).copied().unwrap_or(1.0).max(1e-12);
+            for col in 0..m {
+                pinv[(row, col)] *= inv;
+            }
+        }
+        Some(pinv)
+    } else {
+        let a = j * j.transpose() + DMatrix::<f64>::identity(m, m) * (lambda * lambda);
+        let a_inv = a.lu().solve(&DMatrix::<f64>::identity(m, m))?;
+        Some(j.transpose() * a_inv)
+    }
+}
+
+/// Jacobian Transpose step: δq = α · W⁻¹ · Jᵀ · e
+///
+/// Optimal step size: α = eᵀ·J·Jᵀ·e / ‖J·Jᵀ·e‖²
+fn jt_step(j: &DMatrix<f64>, e: &DVector<f64>, weights: Option<&JointWeights>) -> DVector<f64> {
+    let jjt = j * j.transpose();
+    let jjt_e = &jjt * e;
+    let num = e.dot(&jjt_e);
+    let den = jjt_e.norm_squared();
+    let alpha = if den > 1e-30 { num / den } else { 1e-3 };
+    let n = j.ncols();
+    let mut dq = j.transpose() * e * alpha;
+    if let Some(w) = weights {
+        for i in 0..n {
+            dq[i] *= 1.0 / w.weights.get(i).copied().unwrap_or(1.0).max(1e-12);
+        }
+    }
+    dq
+}
+
+/// Compute one IK step using the configured solver method.
+fn solver_step(j: &DMatrix<f64>, e: &DVector<f64>, config: &IkConfig) -> Option<DVector<f64>> {
+    let wt = config.joint_weights.as_ref();
+    match config.solver_method {
+        SolverMethod::DampedLeastSquares => dls_step(j, e, &config.damping, wt),
+        SolverMethod::JacobianTranspose => Some(jt_step(j, e, wt)),
+    }
+}
+
+/// Compute pseudo-inverse using the configured weights.
+fn solver_pseudoinverse(j: &DMatrix<f64>, config: &IkConfig) -> Option<DMatrix<f64>> {
+    dls_pseudoinverse(j, &config.damping, config.joint_weights.as_ref())
 }
 
 fn apply_step_with_limits(
@@ -158,7 +289,7 @@ fn solve_iterative(
             };
         }
 
-        let Some(mut dq) = dls_step(&j, &e, &config.damping) else {
+        let Some(mut dq) = solver_step(&j, &e, config) else {
             return IkResult {
                 q,
                 iterations: iter,
@@ -345,7 +476,7 @@ pub fn solve_joint_position_ik_with_posture(
         let j_full = compute_joint_jacobian(model, &q, joint_idx);
         let j = j_full.rows(3, 3).into_owned();
 
-        let Some(dq_primary) = dls_step(&j, &e, &config.damping) else {
+        let Some(dq_primary) = solver_step(&j, &e, config) else {
             return IkResult {
                 q,
                 iterations: iter,
@@ -354,7 +485,7 @@ pub fn solve_joint_position_ik_with_posture(
             };
         };
 
-        let Some(j_pinv) = dls_pseudoinverse(&j, &config.damping) else {
+        let Some(j_pinv) = solver_pseudoinverse(&j, config) else {
             return IkResult {
                 q,
                 iterations: iter,
@@ -434,7 +565,7 @@ pub fn solve_two_task_position_ik(
         let j1 = j1_full.rows(3, 3).into_owned();
         let j2 = j2_full.rows(3, 3).into_owned() * secondary_weight;
 
-        let Some(dq1) = dls_step(&j1, &e1, &config.damping) else {
+        let Some(dq1) = solver_step(&j1, &e1, config) else {
             return IkResult {
                 q,
                 iterations: iter,
@@ -443,7 +574,7 @@ pub fn solve_two_task_position_ik(
             };
         };
 
-        let Some(j1_pinv) = dls_pseudoinverse(&j1, &config.damping) else {
+        let Some(j1_pinv) = solver_pseudoinverse(&j1, config) else {
             return IkResult {
                 q,
                 iterations: iter,
@@ -456,7 +587,7 @@ pub fn solve_two_task_position_ik(
         // Secondary task in null-space: J2 N dq2 = e2 - J2 dq1
         let j2n = &j2 * &n;
         let rhs2 = e2 - (&j2 * &dq1);
-        let dq2 = dls_step(&j2n, &rhs2, &config.damping).unwrap_or_else(|| DVector::zeros(model.nv));
+        let dq2 = solver_step(&j2n, &rhs2, config).unwrap_or_else(|| DVector::zeros(model.nv));
 
         let dq = dq1 + &n * dq2;
         let step_norm = dq.norm();
@@ -571,7 +702,7 @@ pub fn solve_joint_position_ik_with_collision_avoidance(
         let j_full = compute_joint_jacobian(model, &q, joint_idx);
         let j = j_full.rows(3, 3).into_owned();
 
-        let Some(dq1) = dls_step(&j, &e_vec, &config.damping) else {
+        let Some(dq1) = solver_step(&j, &e_vec, config) else {
             return IkResult {
                 q,
                 iterations: iter,
@@ -581,7 +712,7 @@ pub fn solve_joint_position_ik_with_collision_avoidance(
         };
 
         // Null-space projector
-        let Some(j_pinv) = dls_pseudoinverse(&j, &config.damping) else {
+        let Some(j_pinv) = solver_pseudoinverse(&j, config) else {
             return IkResult {
                 q,
                 iterations: iter,
@@ -620,6 +751,113 @@ pub fn solve_joint_position_ik_with_collision_avoidance(
         iterations: config.max_iters,
         final_error_norm: last_error,
         status: IkStatus::MaxIterations,
+    }
+}
+
+// ─── Differential (single-step) IK ───────────────────────────────────────────
+
+/// Configuration for a single differential IK step.
+///
+/// Unlike [`IkConfig`] which drives an iterative solver to convergence,
+/// this is for GUI-style "one step per frame" resolved-rate control.
+#[derive(Debug, Clone)]
+pub struct DiffIkConfig {
+    /// Proportional gain ∈ (0, 1].  Fraction of position error to correct
+    /// per step.  Small values (~0.2–0.3) yield smooth, stable tracking.
+    pub gain: f64,
+    /// Hard clamp on each |δqᵢ| (radians) as a safety net.
+    pub max_joint_step: f64,
+    /// Damping strategy to use.
+    pub damping: Damping,
+    /// Solver method (DLS or JT).
+    pub solver_method: SolverMethod,
+    /// Per-joint cost weights.  `None` = uniform.
+    pub joint_weights: Option<JointWeights>,
+    /// Optional task-space projection matrix (m×3).
+    /// When `Some`, the 3D Jacobian and error are projected:
+    ///   J_proj = P · J  (m×n),  Δx_proj = P · Δx  (m)
+    /// Useful for 2-DoF screen-plane IK (m=2, P = [cam_right; cam_up]).
+    pub task_projection: Option<DMatrix<f64>>,
+}
+
+impl Default for DiffIkConfig {
+    fn default() -> Self {
+        Self {
+            gain: 0.3,
+            max_joint_step: 0.15,
+            damping: Damping::Fixed(0.05),
+            solver_method: SolverMethod::DampedLeastSquares,
+            joint_weights: None,
+            task_projection: None,
+        }
+    }
+}
+
+/// Result of a single differential IK step.
+#[derive(Debug, Clone)]
+pub struct DiffIkResult {
+    /// Joint-angle deltas (one per DoF in `chain`).
+    pub dq: Vec<f64>,
+    /// Position error norm *before* this step was applied.
+    pub error_before: f64,
+}
+
+/// Compute one differential IK step (resolved-rate control).
+///
+/// Given a chain of velocity indices and a Jacobian (3×n, world frame),
+/// computes δq to move the end-effector toward `target_pos`.
+///
+/// This is the primitive that GUI interactive IK should call once per frame.
+///
+/// # Parameters
+/// - `jac_world` — 3×n positional Jacobian in world frame.
+/// - `ee_pos` — current EE world position.
+/// - `target_pos` — desired EE world position.
+/// - `config` — solver parameters.
+///
+/// # Returns
+/// [`DiffIkResult`] with joint deltas and the pre-step error norm.
+pub fn differential_ik_step(
+    jac_world: &DMatrix<f64>,
+    ee_pos: &Vector3<f64>,
+    target_pos: &Vector3<f64>,
+    config: &DiffIkConfig,
+) -> DiffIkResult {
+    let n = jac_world.ncols();
+    let dx3 = (target_pos - ee_pos) * config.gain;
+    let error_before = (target_pos - ee_pos).norm();
+
+    // Optionally project to lower-dimensional task space
+    let (dx_vec, jac) = if let Some(ref proj) = config.task_projection {
+        let dx_full = DVector::from_column_slice(&[dx3.x, dx3.y, dx3.z]);
+        (proj * &dx_full, proj * jac_world)
+    } else {
+        (
+            DVector::from_column_slice(&[dx3.x, dx3.y, dx3.z]),
+            jac_world.clone(),
+        )
+    };
+    let m = jac.nrows();
+
+    // Build a temporary IkConfig to reuse solver_step infrastructure
+    let tmp_config = IkConfig {
+        damping: config.damping.clone(),
+        solver_method: config.solver_method,
+        joint_weights: config.joint_weights.clone(),
+        ..IkConfig::default()
+    };
+
+    let mut dq = solver_step(&jac, &dx_vec, &tmp_config)
+        .unwrap_or_else(|| DVector::zeros(n));
+
+    // Safety clamp
+    for i in 0..n {
+        dq[i] = dq[i].clamp(-config.max_joint_step, config.max_joint_step);
+    }
+
+    DiffIkResult {
+        dq: (0..n).map(|i| dq[i]).collect(),
+        error_before,
     }
 }
 
@@ -676,6 +914,7 @@ mod tests {
             step_size: 0.8,
             damping: Damping::Fixed(1e-3),
             joint_limits: None,
+            ..IkConfig::default()
         };
 
         let result = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
@@ -942,5 +1181,160 @@ mod tests {
 
         // Without ACM: the adjacent collision is reported
         assert!(!configuration_is_collision_free(&model, &gm, &[0.0, 0.0], None));
+    }
+
+    // ─── New feature tests ─────────────────────────────────────────────
+
+    #[test]
+    fn jt_solver_converges() {
+        let model = two_link_planar();
+        let q0 = vec![0.1, -0.3];
+        let target = Vector3::new(0.8, 0.6, 0.0);
+        let cfg = IkConfig {
+            max_iters: 500,
+            tol_error: 1e-4,
+            step_size: 0.5,
+            solver_method: SolverMethod::JacobianTranspose,
+            ..IkConfig::default()
+        };
+        let result = solve_joint_position_ik(&model, &q0, 2, target, &cfg);
+        assert_eq!(result.status, IkStatus::Converged);
+    }
+
+    #[test]
+    fn weighted_ik_prefers_cheap_joints() {
+        let model = two_link_planar();
+        let q0 = vec![0.0, 0.0];
+        let target = Vector3::new(0.8, 0.6, 0.0);
+
+        // Uniform: both joints move freely
+        let cfg_uniform = IkConfig {
+            max_iters: 200,
+            tol_error: 1e-6,
+            step_size: 0.8,
+            damping: Damping::Fixed(1e-3),
+            ..IkConfig::default()
+        };
+        let res_uniform = solve_joint_position_ik(&model, &q0, 2, target, &cfg_uniform);
+
+        // Weighted: joint 0 is very expensive (weight=100), joint 1 is cheap (weight=1)
+        let cfg_weighted = IkConfig {
+            joint_weights: Some(JointWeights { weights: vec![100.0, 1.0] }),
+            ..cfg_uniform.clone()
+        };
+        let res_weighted = solve_joint_position_ik(&model, &q0, 2, target, &cfg_weighted);
+
+        // Weighted solution should move joint 0 less
+        assert!(
+            res_weighted.q[0].abs() < res_uniform.q[0].abs(),
+            "Weighted j0={:.4} should be smaller than uniform j0={:.4}",
+            res_weighted.q[0].abs(), res_uniform.q[0].abs(),
+        );
+    }
+
+    #[test]
+    fn differential_ik_step_reduces_error() {
+        let model = two_link_planar();
+        let q = vec![0.3, -0.5];
+        let data = forward_kinematics(&model, &q);
+        let ee = se3::translation(&data.oMi[2]);
+        let target = Vector3::new(0.8, 0.6, 0.0);
+
+        let jac = compute_joint_jacobian(&model, &q, 2)
+            .rows(3, 3).into_owned();
+
+        let cfg = DiffIkConfig::default();
+        let result = differential_ik_step(&jac, &ee, &target, &cfg);
+
+        assert_eq!(result.dq.len(), 2);
+        assert!(result.error_before > 0.0);
+
+        // Apply step and check error decreased
+        let q_new: Vec<f64> = q.iter().zip(&result.dq)
+            .map(|(qi, dqi)| qi + dqi)
+            .collect();
+        let data2 = forward_kinematics(&model, &q_new);
+        let ee2 = se3::translation(&data2.oMi[2]);
+        let error_after = (target - ee2).norm();
+        assert!(error_after < result.error_before);
+    }
+
+    #[test]
+    fn differential_ik_step_with_projection() {
+        let model = two_link_planar();
+        let q = vec![0.3, -0.5];
+        let data = forward_kinematics(&model, &q);
+        let ee = se3::translation(&data.oMi[2]);
+        let target = Vector3::new(0.8, 0.6, 0.0);
+
+        let jac = compute_joint_jacobian(&model, &q, 2)
+            .rows(3, 3).into_owned();
+
+        // Project to XY plane (2-DoF)
+        let mut proj = DMatrix::<f64>::zeros(2, 3);
+        proj[(0, 0)] = 1.0; // X
+        proj[(1, 1)] = 1.0; // Y
+
+        let cfg = DiffIkConfig {
+            task_projection: Some(proj),
+            ..DiffIkConfig::default()
+        };
+        let result = differential_ik_step(&jac, &ee, &target, &cfg);
+        assert_eq!(result.dq.len(), 2);
+        assert!(result.error_before > 0.0);
+    }
+
+    #[test]
+    fn differential_ik_step_with_weights() {
+        let model = two_link_planar();
+        let q = vec![0.0, 0.0];
+        let data = forward_kinematics(&model, &q);
+        let ee = se3::translation(&data.oMi[2]);
+        let target = Vector3::new(0.8, 0.6, 0.0);
+
+        let jac = compute_joint_jacobian(&model, &q, 2)
+            .rows(3, 3).into_owned();
+
+        // Without weights
+        let res_unif = differential_ik_step(&jac, &ee, &target, &DiffIkConfig::default());
+
+        // With weights: j0 very expensive
+        let res_weighted = differential_ik_step(&jac, &ee, &target, &DiffIkConfig {
+            joint_weights: Some(JointWeights { weights: vec![100.0, 1.0] }),
+            ..DiffIkConfig::default()
+        });
+
+        assert!(
+            res_weighted.dq[0].abs() < res_unif.dq[0].abs(),
+            "Weighted dq0={:.6} should be smaller than uniform dq0={:.6}",
+            res_weighted.dq[0].abs(), res_unif.dq[0].abs(),
+        );
+    }
+
+    #[test]
+    fn jt_differential_ik_step() {
+        let model = two_link_planar();
+        let q = vec![0.3, -0.5];
+        let data = forward_kinematics(&model, &q);
+        let ee = se3::translation(&data.oMi[2]);
+        let target = Vector3::new(0.8, 0.6, 0.0);
+
+        let jac = compute_joint_jacobian(&model, &q, 2)
+            .rows(3, 3).into_owned();
+
+        let cfg = DiffIkConfig {
+            solver_method: SolverMethod::JacobianTranspose,
+            ..DiffIkConfig::default()
+        };
+        let result = differential_ik_step(&jac, &ee, &target, &cfg);
+        assert_eq!(result.dq.len(), 2);
+
+        // Apply and check error decreased
+        let q_new: Vec<f64> = q.iter().zip(&result.dq)
+            .map(|(qi, dqi)| qi + dqi)
+            .collect();
+        let data2 = forward_kinematics(&model, &q_new);
+        let ee2 = se3::translation(&data2.oMi[2]);
+        assert!((target - ee2).norm() < result.error_before);
     }
 }

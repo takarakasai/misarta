@@ -6,8 +6,8 @@
 - **名前の由来**: misa (Misato) + art (Articulation) + ta (Takara)
 - **配置**: `articara/misarta/`（独立した Cargo クレート）
 - **依存**: `nalgebra 0.34`（行列演算）、`parry3d-f64`（衝突検出）、`num-dual 0.10`（自動微分、dev-dependencies）
-- **総ソース行数**: 約 21,200 行（テスト含む）
-- **テスト数**: **370 件**（全パス）
+- **総ソース行数**: 約 21,600 行（テスト含む）
+- **テスト数**: **376 件**（全パス）
 
 ---
 
@@ -75,7 +75,7 @@ Pinocchio と同じく、不変のロボット記述（`Model`）と可変の計
 | `src/constrained.rs` | 342 | 拘束付き前向き動力学 + 衝撃動力学 |
 | `src/frames.rs` | 409 | 操作空間フレーム（任意の名前付きフレーム配置・ヤコビアン） |
 | `src/collision.rs` | 832 | 衝突検出（parry3d ベース、ACM、ポテンシャル場） |
-| `src/ik.rs` | 946 | 逆運動学ソルバー（位置/姿勢/ポーズ/マルチタスク/干渉回避） |
+| `src/ik.rs` | 1340 | 逆運動学ソルバー（位置/姿勢/ポーズ/マルチタスク/干渉回避/微分IK） |
 | `src/manifold.rs` | 296 | 構成空間多様体操作（integrate, difference, interpolate） |
 | `src/limits.rs` | 166 | 関節制限（位置/速度/トルク クランプ） |
 | `src/optimization.rs` | 1384 | 最適化 API（iLQR ソルバー、離散動力学線形化、2次コスト近似） |
@@ -100,7 +100,7 @@ Pinocchio と同じく、不変のロボット記述（`Model`）と可変の計
 | `src/coriolis.rs` | 446 | コリオリ行列 $C(q, \dot{q})$ |
 | `src/utils.rs` | 321 | 数値微分ユーティリティ（ヤコビアン、ヘッシアン） |
 | `src/lib.rs` | 33 | モジュール登録（33 モジュール） |
-| **合計** | **~21,200** | |
+| **合計** | **~21,600** | |
 
 ---
 
@@ -362,7 +362,9 @@ $$\begin{bmatrix} M & J_c^T \\ J_c & 0 \end{bmatrix} \begin{bmatrix} v^+ \\ \Lam
 
 ### 4.15 逆運動学 (`ik.rs`)
 
-ダンプド最小二乗法（DLS）ベースの反復 IK ソルバー。
+DLS / Jacobian Transpose ベースの反復 IK ソルバー群と、1 ステップ微分 IK（resolved-rate control）API を提供する。
+
+#### 4.15.1 反復 IK ソルバー
 
 | 関数 | 説明 |
 |------|------|
@@ -375,8 +377,62 @@ $$\begin{bmatrix} M & J_c^T \\ J_c & 0 \end{bmatrix} \begin{bmatrix} v^+ \\ \Lam
 | `solve_two_task_position_ik` | 2 タスク IK（主タスク + 副タスク） |
 | `solve_joint_position_ik_with_collision_avoidance` | 干渉回避 IK |
 
-**設定**:
-- `IkConfig`: 最大反復回数、収束トルランス、ステップサイズ、ダンピング（固定 / 適応的マニピュラビリティ）、関節制限
+#### 4.15.2 ソルバー手法 (`SolverMethod`)
+
+| バリアント | 数式 | 特徴 |
+|-----------|------|------|
+| `DampedLeastSquares` | $\delta q = W^{-1}J^T(JW^{-1}J^T + \lambda^2 I)^{-1} e$ | 特異点付近でも安定、固定 $\lambda$ or 適応的マニピュラビリティ |
+| `JacobianTranspose` | $\delta q = \alpha \cdot W^{-1} \cdot J^T \cdot e$ | 行列逆計算不要、$\alpha = \frac{e^T J J^T e}{\|J J^T e\|^2}$ で最適ステップ自動計算 |
+
+`solver_step` / `solver_pseudoinverse` が `SolverMethod` に基づいてディスパッチする。
+
+#### 4.15.3 関節重み (`JointWeights`)
+
+重み付き擬似逆行列 $J^+_W = W^{-1} J^T (J W^{-1} J^T + \lambda^2 I)^{-1}$ を実現するための、DoF ごとのコスト重み。
+
+| コンストラクタ | 説明 |
+|--------------|------|
+| `JointWeights::uniform(nv)` | 全 DoF に均一重み（$w_i = 1$） |
+| `JointWeights::ee_proximal(nv, chain, alpha)` | EE に近い関節ほど安い重み：$w_i = \alpha^{n-1-i}$。ルート側の関節を抑制し、EE 近傍を優先 |
+
+#### 4.15.4 微分 IK（resolved-rate control）
+
+1 フレームに 1 ステップずつ EE を目標に近づける比例ゲイン制御。GUI のインタラクティブ IK ドラッグ等に最適。
+
+```rust
+pub fn differential_ik_step(
+    jac_world: &DMatrix<f64>,   // 3×n 位置ヤコビアン（ワールド座標）
+    ee_pos: &Vector3<f64>,       // 現在の EE ワールド位置
+    target_pos: &Vector3<f64>,   // 目標ワールド位置
+    config: &DiffIkConfig,
+) -> DiffIkResult
+```
+
+**`DiffIkConfig`**:
+
+| フィールド | 型 | デフォルト | 説明 |
+|-----------|------|----------|------|
+| `gain` | `f64` | `0.3` | 比例ゲイン $\in (0, 1]$。1 ステップで誤差の何割を修正するか |
+| `max_joint_step` | `f64` | `0.15` | 各 $|\delta q_i|$ の上限（rad）。安全クランプ |
+| `damping` | `Damping` | `Fixed(0.05)` | ダンピング戦略 |
+| `solver_method` | `SolverMethod` | `DampedLeastSquares` | ソルバー手法 |
+| `joint_weights` | `Option<JointWeights>` | `None` | 関節重み（`None` = 均一） |
+| `task_projection` | `Option<DMatrix<f64>>` | `None` | タスク空間射影行列（$m \times 3$）。2-DoF スクリーンプレーン IK 等に使用 |
+
+**`DiffIkResult`**:
+
+| フィールド | 型 | 説明 |
+|-----------|------|------|
+| `dq` | `Vec<f64>` | 関節角度変化量（チェイン内の DoF 数分） |
+| `error_before` | `f64` | ステップ適用前の位置誤差ノルム |
+
+**タスク空間射影**: `task_projection = Some(P)` を指定すると、3D ヤコビアンと誤差を $P$ で射影する：
+$$J_{\text{proj}} = P \cdot J \quad (m \times n), \qquad \Delta x_{\text{proj}} = P \cdot \Delta x \quad (m)$$
+例えばカメラの右/上方向ベクトルで $2 \times 3$ 行列を構成すれば、スクリーン平面上の 2-DoF IK となる。
+
+#### 4.15.5 設定
+
+- `IkConfig`: 最大反復回数、収束トルランス、ステップサイズ、ダンピング（固定 / 適応的マニピュラビリティ）、関節制限、ソルバー手法、関節重み
 - `Damping::AdaptiveManipulability`: マニピュラビリティ指標に基づくダンピング自動調整
 
 ### 4.16 衝突検出 (`collision.rs`)
@@ -832,6 +888,9 @@ IK / 最適化では独立変数のみ扱い、FK 呼び出し前に `enforce_mi
 | **フレーム** | `updateFramePlacements` | `compute_frame_placement` | ✅ |
 | | `computeFrameJacobian` | `compute_frame_jacobian` | ✅ |
 | **IK** | — | `solve_joint_*_ik` (7 種) | ✅ |
+| **微分 IK** | — (resolved-rate) | `differential_ik_step` | ✅ |
+| **JT ソルバー** | — | `jt_step` / `SolverMethod::JacobianTranspose` | ✅ |
+| **重み付き擬似逆** | — | `JointWeights` + weighted DLS | ✅ |
 | **拘束ヤコビアン** | `computeConstraintJacobian` | `compute_constraint_jacobian` | ✅ |
 | **拘束 IK** | — | `solve_constrained_ik`, `solve_task_with_constraints` 等 | ✅ |
 | **不等式拘束 IK** | — (QP ベース) | `solve_*_qp` (3 種) | ✅ |
