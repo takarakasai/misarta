@@ -121,6 +121,7 @@ pub fn load_urdf_geometry_string(
                     mesh_path,
                     mesh_scale,
                     mesh_data: None,
+            material: None,
                 });
             }
         }
@@ -146,6 +147,7 @@ pub fn load_urdf_geometry_string(
                     mesh_path,
                     mesh_scale,
                     mesh_data: None,
+            material: None,
                 });
             }
         }

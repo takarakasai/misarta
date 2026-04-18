@@ -16,7 +16,6 @@
 
 use crate::fk::forward_kinematics;
 use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
-use crate::mesh::MeshData;
 use crate::model::Model;
 use std::collections::HashSet;
 
@@ -472,6 +471,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         gm.add(GeometryObject {
@@ -482,6 +482,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -502,6 +503,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         gm.add(GeometryObject {
@@ -512,6 +514,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -532,6 +535,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         gm.add(GeometryObject {
@@ -542,6 +546,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -564,6 +569,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -573,6 +579,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -597,6 +604,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "link2_geom".into(),
@@ -606,6 +614,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -643,6 +652,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -652,6 +662,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -673,6 +684,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -682,6 +694,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -707,6 +720,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -716,6 +730,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -736,6 +751,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -745,6 +761,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0];
@@ -765,6 +782,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -774,6 +792,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0]; // distance = 0.5
@@ -793,6 +812,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -802,6 +822,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         let q = vec![0.0]; // distance = 1.5 - 0.2 = 1.3

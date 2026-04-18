@@ -6,6 +6,7 @@ pub mod fk;
 pub mod jacobian;
 pub mod geometry;
 pub mod mesh;
+pub mod collada;
 pub mod urdf;
 pub mod sdf;
 pub mod collision;

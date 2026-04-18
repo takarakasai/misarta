@@ -20,11 +20,12 @@
 //!     mesh_path: None,
 //!     mesh_scale: None,
 //!     mesh_data: None,
+//!     material: None,
 //! });
 //! assert_eq!(gmodel.num_objects(), 1);
 //! ```
 
-use crate::mesh::MeshData;
+use crate::mesh::{Material, MeshData};
 use crate::se3::SE3;
 use nalgebra::Vector3;
 
@@ -80,6 +81,10 @@ pub struct GeometryObject {
     /// file was successfully read).  Used for collision detection and
     /// rendering.
     pub mesh_data: Option<MeshData>,
+    /// Surface material for this geometry (colour, texture, etc.).
+    /// When `mesh_data` contains per-submesh materials those take priority;
+    /// this field provides a fallback / override for the whole object.
+    pub material: Option<Material>,
 }
 
 // ─── Geometry model ─────────────────────────────────────────────────────────
@@ -104,6 +109,7 @@ pub struct GeometryObject {
 ///     mesh_path: None,
 ///     mesh_scale: None,
 ///     mesh_data: None,
+///     material: None,
 /// });
 /// assert_eq!(visual.num_objects(), 1);
 /// assert_eq!(visual.objects[0].name, "box_visual");
@@ -178,6 +184,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         assert_eq!(idx, 0);
         assert_eq!(gm.num_objects(), 1);
@@ -196,6 +203,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -208,6 +216,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
         gm.add(GeometryObject {
             name: "c".into(),
@@ -220,6 +229,7 @@ mod tests {
             mesh_path: None,
             mesh_scale: None,
             mesh_data: None,
+            material: None,
         });
 
         assert_eq!(gm.objects_for_joint(0), vec![0, 2]);

@@ -1,8 +1,9 @@
 //! Triangle mesh loading and conversion.
 //!
-//! Loads external mesh files (currently **STL**) into [`MeshData`] — an indexed
-//! triangle mesh with per-face normals — and provides conversion to parry3d's
-//! [`TriMesh`](parry3d::shape::TriMesh) for collision detection.
+//! Loads external mesh files (**STL**, **Collada / DAE**) into [`MeshData`] — an
+//! indexed triangle mesh with per-face normals, optional per-vertex normals,
+//! texture coordinates, materials and sub-meshes — and provides conversion to
+//! parry3d's [`TriMesh`](parry3d::shape::TriMesh) for collision detection.
 //!
 //! # Example
 //!
@@ -19,8 +20,74 @@
 //! let trimesh = scaled.to_trimesh();
 //! ```
 
-use nalgebra::{Point3, Vector3};
+use nalgebra::{Point2, Point3, Vector3};
 use std::path::Path;
+
+// ─── Material ───────────────────────────────────────────────────────────────
+
+/// Surface material properties (Phong / Lambert).
+///
+/// Colours are linear RGBA in `[0, 1]`.  Only `diffuse` is required; the
+/// others default to sensible values for a matte surface.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Material {
+    /// Human-readable name (may be empty).
+    pub name: String,
+    /// Diffuse colour — the primary surface colour.
+    pub diffuse: [f64; 4],
+    /// Specular colour (default `[0, 0, 0, 1]`).
+    pub specular: [f64; 4],
+    /// Ambient colour (default = same as diffuse).
+    pub ambient: [f64; 4],
+    /// Emissive colour (default `[0, 0, 0, 1]`).
+    pub emission: [f64; 4],
+    /// Phong shininess exponent (default `0`).
+    pub shininess: f64,
+    /// File path of the diffuse texture image (empty = none).
+    pub texture_diffuse: Option<String>,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            diffuse: [0.8, 0.8, 0.8, 1.0],
+            specular: [0.0, 0.0, 0.0, 1.0],
+            ambient: [0.8, 0.8, 0.8, 1.0],
+            emission: [0.0, 0.0, 0.0, 1.0],
+            shininess: 0.0,
+            texture_diffuse: None,
+        }
+    }
+}
+
+impl Material {
+    /// Create a simple material with only a diffuse colour.
+    pub fn from_color(r: f64, g: f64, b: f64, a: f64) -> Self {
+        Self {
+            diffuse: [r, g, b, a],
+            ambient: [r, g, b, a],
+            ..Default::default()
+        }
+    }
+}
+
+// ─── SubMesh ────────────────────────────────────────────────────────────────
+
+/// A contiguous range of triangles that share a single [`Material`].
+///
+/// `tri_start..tri_start + tri_count` indexes into [`MeshData::indices`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubMesh {
+    /// Human-readable name (e.g. the Collada `<geometry>` id).
+    pub name: String,
+    /// Index of the first triangle in [`MeshData::indices`].
+    pub tri_start: usize,
+    /// Number of triangles in this sub-mesh.
+    pub tri_count: usize,
+    /// Index into [`MeshData::materials`].
+    pub material_index: Option<usize>,
+}
 
 // ─── MeshData ───────────────────────────────────────────────────────────────
 
@@ -29,6 +96,11 @@ use std::path::Path;
 /// Vertices are deduplicated so that shared vertices between triangles have a
 /// single entry in [`vertices`](MeshData::vertices). Triangle connectivity is
 /// stored in [`indices`](MeshData::indices).
+///
+/// Optionally stores:
+/// - per-vertex normals ([`vertex_normals`](MeshData::vertex_normals))
+/// - texture coordinates ([`texcoords`](MeshData::texcoords))
+/// - [`materials`](MeshData::materials) and [`submeshes`](MeshData::submeshes)
 #[derive(Debug, Clone)]
 pub struct MeshData {
     /// Unique vertex positions.
@@ -37,6 +109,21 @@ pub struct MeshData {
     pub indices: Vec<[u32; 3]>,
     /// Per-face normals (one per triangle, same length as `indices`).
     pub face_normals: Vec<Vector3<f64>>,
+
+    // ── Optional attributes ─────────────────────────────────────────────
+
+    /// Per-vertex normals (same length as `vertices`, or empty).
+    pub vertex_normals: Vec<Vector3<f64>>,
+    /// Per-vertex texture coordinates (same length as `vertices`, or empty).
+    pub texcoords: Vec<Point2<f64>>,
+
+    // ── Materials & sub-meshes ───────────────────────────────────────────
+
+    /// Material table.  Indexed by [`SubMesh::material_index`].
+    pub materials: Vec<Material>,
+    /// Sub-meshes — each refers to a contiguous triangle range and an optional
+    /// material.  If empty the whole mesh has no material assignment.
+    pub submeshes: Vec<SubMesh>,
 }
 
 impl MeshData {
@@ -92,6 +179,10 @@ impl MeshData {
             vertices,
             indices,
             face_normals,
+            vertex_normals: Vec::new(),
+            texcoords: Vec::new(),
+            materials: Vec::new(),
+            submeshes: Vec::new(),
         })
     }
 
@@ -105,6 +196,10 @@ impl MeshData {
                 vertices: Vec::new(),
                 indices: Vec::new(),
                 face_normals: Vec::new(),
+                vertex_normals: Vec::new(),
+                texcoords: Vec::new(),
+                materials: Vec::new(),
+                submeshes: Vec::new(),
             });
         }
 
@@ -158,6 +253,10 @@ impl MeshData {
             vertices,
             indices,
             face_normals,
+            vertex_normals: Vec::new(),
+            texcoords: Vec::new(),
+            materials: Vec::new(),
+            submeshes: Vec::new(),
         })
     }
 
@@ -171,6 +270,36 @@ impl MeshData {
     /// Number of triangles.
     pub fn num_triangles(&self) -> usize {
         self.indices.len()
+    }
+
+    /// `true` if per-vertex normals are populated (same count as `vertices`).
+    pub fn has_vertex_normals(&self) -> bool {
+        self.vertex_normals.len() == self.vertices.len()
+    }
+
+    /// `true` if texture coordinates are populated (same count as `vertices`).
+    pub fn has_texcoords(&self) -> bool {
+        self.texcoords.len() == self.vertices.len()
+    }
+
+    /// Number of materials.
+    pub fn num_materials(&self) -> usize {
+        self.materials.len()
+    }
+
+    /// Number of sub-meshes.
+    pub fn num_submeshes(&self) -> usize {
+        self.submeshes.len()
+    }
+
+    /// Return the material for triangle `tri_idx`, if any.
+    pub fn material_for_triangle(&self, tri_idx: usize) -> Option<&Material> {
+        for sm in &self.submeshes {
+            if tri_idx >= sm.tri_start && tri_idx < sm.tri_start + sm.tri_count {
+                return sm.material_index.and_then(|mi| self.materials.get(mi));
+            }
+        }
+        None
     }
 
     /// Axis-aligned bounding box `(min_corner, max_corner)`.
@@ -224,10 +353,28 @@ impl MeshData {
             })
             .collect();
 
+        // Recompute vertex normals after scaling.
+        let vertex_normals = if self.vertex_normals.is_empty() {
+            Vec::new()
+        } else {
+            self.vertex_normals.iter().enumerate().map(|(i, _)| {
+                // Approximate: use inverse-transpose of scale diagonal.
+                // For axis-aligned scale S, n' = normalize(S^{-T} n).
+                let n = &self.vertex_normals[i];
+                let sn = Vector3::new(n.x / scale.x, n.y / scale.y, n.z / scale.z);
+                let len = sn.norm();
+                if len > 1e-30 { sn / len } else { Vector3::zeros() }
+            }).collect()
+        };
+
         Self {
             vertices,
             indices: self.indices.clone(),
             face_normals,
+            vertex_normals,
+            texcoords: self.texcoords.clone(),
+            materials: self.materials.clone(),
+            submeshes: self.submeshes.clone(),
         }
     }
 
@@ -364,6 +511,11 @@ pub fn load_meshes_for_geometry_model(
                 match ext.to_ascii_lowercase().as_str() {
                     "stl" => {
                         if let Ok(md) = MeshData::from_stl(&resolved) {
+                            obj.mesh_data = Some(md);
+                        }
+                    }
+                    "dae" => {
+                        if let Ok(md) = crate::collada::load_dae(&resolved) {
                             obj.mesh_data = Some(md);
                         }
                     }

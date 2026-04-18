@@ -15,5 +15,3 @@ stl_io = "0.11"
 [dev-dependencies]
 num-dual = "0.10"
 approx = "0.5"
-
-[workspace]
