@@ -184,6 +184,8 @@ pub fn load_urdf_string(xml: &str) -> Result<Model<f64>, UrdfError> {
         parent_link: String,
         child_link: String,
         origin: nalgebra::Isometry3<f64>,
+        /// URDF `<mimic joint="..." multiplier="..." offset="..."/>`
+        mimic: Option<(String, f64, f64)>,
     }
 
     let mut joints: Vec<JointInfo> = Vec::new();
@@ -222,12 +224,33 @@ pub fn load_urdf_string(xml: &str) -> Result<Model<f64>, UrdfError> {
             other => return Err(UrdfError::UnsupportedJointType(other.to_string())),
         };
 
+        // Parse optional <mimic joint="..." multiplier="..." offset="..."/>
+        let mimic = joint_el
+            .children()
+            .find(|n| n.tag_name().name() == "mimic")
+            .map(|mimic_el| {
+                let master_name = mimic_el
+                    .attribute("joint")
+                    .unwrap_or("")
+                    .to_string();
+                let multiplier: f64 = mimic_el
+                    .attribute("multiplier")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1.0);
+                let offset: f64 = mimic_el
+                    .attribute("offset")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                (master_name, multiplier, offset)
+            });
+
         joints.push(JointInfo {
             name,
             joint_type,
             parent_link,
             child_link,
             origin,
+            mimic,
         });
     }
 
@@ -290,7 +313,34 @@ pub fn load_urdf_string(xml: &str) -> Result<Model<f64>, UrdfError> {
         );
     }
 
-    Ok(builder.build())
+    // ── Apply mimic constraints ─────────────────────────────────────────
+    // We need to resolve master joint names to model indices.
+    // Build joint_name → model index map.
+    let model_tmp = builder.build();
+    let joint_name_to_idx: HashMap<&str, usize> = model_tmp
+        .joints
+        .iter()
+        .enumerate()
+        .map(|(i, j)| (j.name.as_str(), i))
+        .collect();
+
+    let mut builder2 = ModelBuilder::from_model(&model_tmp);
+    for ji in &ordered_joints {
+        if let Some((ref master_name, multiplier, offset)) = ji.mimic {
+            let slave_idx = *joint_name_to_idx.get(ji.name.as_str()).ok_or_else(|| {
+                UrdfError::Topology(format!("mimic slave joint '{}' not found", ji.name))
+            })?;
+            let master_idx = *joint_name_to_idx.get(master_name.as_str()).ok_or_else(|| {
+                UrdfError::Topology(format!(
+                    "mimic master joint '{}' (referenced by '{}') not found",
+                    master_name, ji.name
+                ))
+            })?;
+            builder2 = builder2.add_mimic(slave_idx, master_idx, multiplier, offset);
+        }
+    }
+
+    Ok(builder2.build())
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────────────

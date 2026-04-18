@@ -27,4 +27,5 @@ pub mod rnea_derivatives;
 pub mod aba_derivatives;
 pub mod reduced;
 pub mod constraint;
+pub mod mimic;
 pub mod qp;

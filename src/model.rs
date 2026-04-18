@@ -11,6 +11,34 @@ use crate::joint::JointType;
 use crate::se3::{self, SE3};
 use nalgebra::{Matrix3, RealField, Vector3};
 
+// ─── Mimic (coupled) joint ──────────────────────────────────────────────────
+
+/// A mimic (coupled) joint relation: `q_slave = multiplier * q_master + offset`.
+///
+/// Corresponds to URDF's `<mimic joint="master" multiplier="m" offset="o"/>`.
+/// The slave joint retains its original `JointType` (e.g. `Revolute`) in the
+/// kinematic tree — its configuration is simply overwritten by this affine
+/// mapping before FK / dynamics algorithms are called.
+///
+/// # Constraints
+///
+/// - Both `master` and `slave` must be 1-DOF joints (`Revolute` or `Prismatic`).
+/// - `master` and `slave` are 1-based joint indices (0 = universe is invalid).
+/// - Chained mimic joints (slave of a slave) are **not** checked at build
+///   time but will work correctly with [`crate::mimic::enforce_mimic`] which
+///   iterates in declaration order.
+#[derive(Debug, Clone)]
+pub struct MimicJoint<T: RealField> {
+    /// Index of the slave joint (1-based).
+    pub slave: usize,
+    /// Index of the master joint (1-based).
+    pub master: usize,
+    /// Gear ratio: `q_slave = multiplier * q_master + offset`.
+    pub multiplier: T,
+    /// Offset: `q_slave = multiplier * q_master + offset`.
+    pub offset: T,
+}
+
 // ─── Single joint frame ─────────────────────────────────────────────────────
 
 /// One joint in the kinematic tree.
@@ -75,6 +103,11 @@ pub struct Model<T: RealField> {
     pub nv: usize,
     /// Gravity vector in the world frame
     pub gravity: Vector3<T>,
+    /// Mimic (coupled) joint constraints.
+    ///
+    /// Each entry maps a slave joint to its master via an affine relation.
+    /// See [`MimicJoint`] for details.
+    pub mimic: Vec<MimicJoint<T>>,
 }
 
 impl<T: RealField> Model<T> {
@@ -146,6 +179,21 @@ impl<T: RealField> Model<T> {
                 return false;
             }
             if (a.rotational_inertia.clone() - b.rotational_inertia.clone()).norm() > epsilon.clone() {
+                return false;
+            }
+        }
+        // Compare mimic constraints
+        if self.mimic.len() != other.mimic.len() {
+            return false;
+        }
+        for (a, b) in self.mimic.iter().zip(other.mimic.iter()) {
+            if a.slave != b.slave || a.master != b.master {
+                return false;
+            }
+            if (a.multiplier.clone() - b.multiplier.clone()).abs() > epsilon.clone() {
+                return false;
+            }
+            if (a.offset.clone() - b.offset.clone()).abs() > epsilon.clone() {
                 return false;
             }
         }
@@ -275,6 +323,7 @@ pub struct ModelBuilder<T: RealField> {
     q_idx: Vec<usize>,
     v_idx: Vec<usize>,
     gravity: Vector3<T>,
+    mimic: Vec<MimicJoint<T>>,
 }
 
 impl<T: RealField> ModelBuilder<T> {
@@ -296,6 +345,7 @@ impl<T: RealField> ModelBuilder<T> {
             q_idx: vec![0],
             v_idx: vec![0],
             gravity: Vector3::new(T::zero(), T::zero(), nalgebra::convert(-9.81)),
+            mimic: Vec::new(),
         }
     }
 
@@ -315,6 +365,26 @@ impl<T: RealField> ModelBuilder<T> {
     pub fn gravity(mut self, g: Vector3<T>) -> Self {
         self.gravity = g;
         self
+    }
+
+    /// Reconstruct a builder from an existing `Model`, preserving all joints,
+    /// inertias, link names, and gravity — but **not** mimic constraints.
+    ///
+    /// This is useful when you need to clone a model's tree structure and
+    /// selectively re-add mimic constraints.
+    pub fn from_model(model: &Model<T>) -> Self {
+        Self {
+            name: model.name.clone(),
+            joints: model.joints.clone(),
+            inertias: model.inertias.clone(),
+            link_names: model.link_names.clone(),
+            nq: model.nq,
+            nv: model.nv,
+            q_idx: model.q_idx.clone(),
+            v_idx: model.v_idx.clone(),
+            gravity: model.gravity.clone(),
+            mimic: Vec::new(),
+        }
     }
 
     /// Add a joint (and its associated link) to the model.
@@ -366,6 +436,55 @@ impl<T: RealField> ModelBuilder<T> {
         self
     }
 
+    /// Add a mimic (coupled) joint constraint.
+    ///
+    /// - `slave`: index of the slave joint (1-based)
+    /// - `master`: index of the master joint (1-based)
+    /// - `multiplier`: gear ratio (`q_slave = multiplier * q_master + offset`)
+    /// - `offset`: constant offset
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slave` or `master` are out of range or refer to joints
+    /// that are not 1-DOF (revolute or prismatic).
+    pub fn add_mimic(
+        mut self,
+        slave: usize,
+        master: usize,
+        multiplier: T,
+        offset: T,
+    ) -> Self {
+        assert!(
+            slave > 0 && slave < self.joints.len(),
+            "mimic slave index {} out of range (model has {} joints)",
+            slave,
+            self.joints.len() - 1,
+        );
+        assert!(
+            master > 0 && master < self.joints.len(),
+            "mimic master index {} out of range (model has {} joints)",
+            master,
+            self.joints.len() - 1,
+        );
+        assert!(
+            self.joints[slave].joint_type.nq() == 1,
+            "mimic slave joint '{}' must be 1-DOF (revolute or prismatic)",
+            self.joints[slave].name,
+        );
+        assert!(
+            self.joints[master].joint_type.nq() == 1,
+            "mimic master joint '{}' must be 1-DOF (revolute or prismatic)",
+            self.joints[master].name,
+        );
+        self.mimic.push(MimicJoint {
+            slave,
+            master,
+            multiplier,
+            offset,
+        });
+        self
+    }
+
     /// Consume the builder and produce an immutable `Model`.
     pub fn build(self) -> Model<T> {
         Model {
@@ -378,6 +497,7 @@ impl<T: RealField> ModelBuilder<T> {
             nq: self.nq,
             nv: self.nv,
             gravity: self.gravity,
+            mimic: self.mimic,
         }
     }
 }
