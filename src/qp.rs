@@ -141,7 +141,7 @@ pub fn solve_qp(
             assert_eq!(v.nrows(), n, "x0 length must match H dimension");
             v.clone()
         }
-        None => initial_feasible(n, &ae, &be, config),
+        None => initial_feasible(n, &ae, &be, &ai, &bi, config),
     };
 
     // Verify feasibility
@@ -279,18 +279,76 @@ fn initial_feasible(
     n: usize,
     ae: &DMatrix<f64>,
     be: &DVector<f64>,
-    _config: &QpConfig,
+    ai: &DMatrix<f64>,
+    bi: &DVector<f64>,
+    config: &QpConfig,
 ) -> DVector<f64> {
     let m_eq = ae.nrows();
+    let m_iq = ai.nrows();
+
     if m_eq == 0 {
         return DVector::zeros(n);
     }
+
     // Least-norm: x = Aᵀ (A Aᵀ)⁻¹ b
     let aat = ae * ae.transpose();
-    match aat.lu().solve(be) {
+    let x0 = match aat.clone().lu().solve(be) {
         Some(y) => ae.transpose() * y,
-        None => DVector::zeros(n),
+        None => return DVector::zeros(n),
+    };
+
+    // Check inequality feasibility
+    if m_iq == 0 {
+        return x0;
     }
+    let vals = ai * &x0;
+    let mut feasible = true;
+    for i in 0..m_iq {
+        if vals[i] > bi[i] + config.feasibility_tol {
+            feasible = false;
+            break;
+        }
+    }
+    if feasible {
+        return x0;
+    }
+
+    // The least-norm equality-feasible point violates some inequality.
+    // Project into the feasible set via the null space of A_eq.
+    // Null-space projector: P = I − Aᵀ (A Aᵀ)⁻¹ A
+    let aat_inv = match aat.lu().solve(&DMatrix::identity(m_eq, m_eq)) {
+        Some(v) => v,
+        None => return x0, // fallback
+    };
+    let proj_null = DMatrix::identity(n, n) - ae.transpose() * &aat_inv * ae;
+
+    let mut x = x0;
+    for _ in 0..200 {
+        let vals = ai * &x;
+        let mut max_viol = f64::NEG_INFINITY;
+        let mut worst = 0usize;
+        for i in 0..m_iq {
+            let v = vals[i] - bi[i];
+            if v > max_viol {
+                max_viol = v;
+                worst = i;
+            }
+        }
+        if max_viol <= config.feasibility_tol {
+            return x;
+        }
+
+        // Move x along the null-space projection of a_worst to reduce violation.
+        let ai_col: DVector<f64> = ai.row(worst).transpose().into_owned();
+        let p_ai = &proj_null * &ai_col;
+        let denom = ai_col.dot(&p_ai);
+        if denom < 1e-15 {
+            break; // cannot move in null space
+        }
+        let alpha = max_viol / denom;
+        x -= alpha * p_ai;
+    }
+    x
 }
 
 fn build_active_matrix(

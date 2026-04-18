@@ -904,6 +904,10 @@ pub fn stack_inequalities(pairs: &[(&DMatrix<f64>, &DVector<f64>)]) -> (DMatrix<
 }
 
 /// Internal: build the combined inequality (A_iq, b_iq) for a single QP step.
+///
+/// When `step_size < 1`, the bounds are scaled by `1 / step_size` so that
+/// after multiplying the QP solution by `step_size`, the actual step
+/// still satisfies the original limits.
 fn build_step_inequalities(
     model: &Model<f64>,
     q: &[f64],
@@ -922,7 +926,13 @@ fn build_step_inequalities(
     }
     let refs: Vec<(&DMatrix<f64>, &DVector<f64>)> =
         parts.iter().map(|(a, b)| (a, b)).collect();
-    Some(stack_inequalities(&refs))
+    let (a, mut b) = stack_inequalities(&refs);
+    // Scale bounds: QP solves for dq_raw, actual step is step_size * dq_raw.
+    // We need step_size * dq_raw ≤ b_orig, i.e., dq_raw ≤ b_orig / step_size.
+    if config.step_size > 0.0 && config.step_size < 1.0 {
+        b /= config.step_size;
+    }
+    Some((a, b))
 }
 
 /// Solve constraint-only IK (no primary task) with inequality bounds via QP.
@@ -939,6 +949,10 @@ pub fn solve_constrained_ik_qp(
 
     let nv = model.nv;
     let mut q = q0.to_vec();
+    // Clamp initial q to limits
+    if let Some(ref lim) = config.joint_limits {
+        q = crate::limits::clamp_configuration(model, &q, lim);
+    }
     let mut last_err = f64::INFINITY;
 
     let qp_cfg = QpConfig {
@@ -990,6 +1004,10 @@ pub fn solve_constrained_ik_qp(
 
         let dq = &sol.x * config.step_size;
         q = crate::manifold::integrate(model, &q, dq.as_slice(), 1.0);
+        // Clamp to limits after integration (safety net)
+        if let Some(ref lim) = config.joint_limits {
+            q = crate::limits::clamp_configuration(model, &q, lim);
+        }
     }
 
     ConstrainedIkResult {
@@ -1020,6 +1038,9 @@ pub fn solve_task_with_constraints_qp(
     let nv = model.nv;
     let nc = cm.total_dim();
     let mut q = q0.to_vec();
+    if let Some(ref lim) = config.joint_limits {
+        q = crate::limits::clamp_configuration(model, &q, lim);
+    }
     let mut last_task_err = f64::INFINITY;
     let mut last_constraint_err = f64::INFINITY;
 
@@ -1100,6 +1121,9 @@ pub fn solve_task_with_constraints_qp(
 
         let dq = &sol.x * config.step_size;
         q = crate::manifold::integrate(model, &q, dq.as_slice(), 1.0);
+        if let Some(ref lim) = config.joint_limits {
+            q = crate::limits::clamp_configuration(model, &q, lim);
+        }
     }
 
     ConstrainedIkResult {
@@ -1130,6 +1154,9 @@ pub fn solve_frame_task_with_constraints_qp(
     let nv = model.nv;
     let nc = cm.total_dim();
     let mut q = q0.to_vec();
+    if let Some(ref lim) = config.joint_limits {
+        q = crate::limits::clamp_configuration(model, &q, lim);
+    }
     let mut last_task_err = f64::INFINITY;
     let mut last_constraint_err = f64::INFINITY;
 
@@ -1219,6 +1246,9 @@ pub fn solve_frame_task_with_constraints_qp(
 
         let dq = &sol.x * config.step_size;
         q = crate::manifold::integrate(model, &q, dq.as_slice(), 1.0);
+        if let Some(ref lim) = config.joint_limits {
+            q = crate::limits::clamp_configuration(model, &q, lim);
+        }
     }
 
     ConstrainedIkResult {
