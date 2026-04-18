@@ -7,6 +7,7 @@ description = "Rigid body kinematics and dynamics for articulated robots"
 # misa (Misato) + art (Articulation) + ta (Takara)
 
 [dependencies]
+clarabel = { version = "0.11.1", features = ["default"], optional = true }
 nalgebra = "0.34.2"
 parry3d = { package = "parry3d-f64", version = "0.25" }
 roxmltree = "0.20"
@@ -15,3 +16,6 @@ stl_io = "0.11"
 [dev-dependencies]
 num-dual = "0.10"
 approx = "0.5"
+
+[features]
+clarabel = ["dep:clarabel"]

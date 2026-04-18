@@ -89,7 +89,7 @@ Pinocchio と同じく、不変のロボット記述（`Model`）と可変の計
 | `src/reduced.rs` | 1055 | モデルリダクション（Pinocchio `buildReducedModel` 相当） |
 | `src/constraint.rs` | 2280 | 拘束ヤコビアン・等式/不等式拘束付き IK（QP ベース） |
 | `src/mimic.rs` | 368 | Mimic（連動）関節ユーティリティ（射影、射影行列、トルク射影） |
-| `src/qp.rs` | 782 | 密 QP ソルバー（プライマル・アクティブセット法） |
+| `src/qp.rs` | 1100+ | 密 QP ソルバー（プラグイン可能バックエンド: ActiveSet / Clarabel） |
 | `src/utils.rs` | 321 | 数値微分ユーティリティ（ヤコビアン、ヘッシアン） |
 | `src/lib.rs` | 31 | モジュール登録（31 モジュール） |
 | **合計** | **~19,500** | |
@@ -583,24 +583,59 @@ $$\min_{dq} \lVert J_t\, dq - e_t\rVert^2 + w^2 \lVert J_c\, dq + e_c\rVert^2 + 
 
 ### 4.28 QP ソルバー (`qp.rs`)
 
-自己完結型のプライマル・アクティブセット法 QP ソルバー。外部依存なし。
+プラグイン可能なバックエンドを備えた密 QP ソルバー。
 
 $$\min_x \frac{1}{2} x^T H x + c^T x \quad \text{s.t.} \quad A_{eq}\, x = b_{eq}, \quad A_{iq}\, x \le b_{iq}$$
 
+**バックエンド選択 (`QpSolver` enum)**:
+
+| バリアント | アルゴリズム | Cargo feature | 外部依存 |
+|-----------|-------------|---------------|---------|
+| `ActiveSet` *(default)* | プライマル・アクティブセット法（密、自己完結） | なし（常に利用可能） | なし |
+| `Clarabel` | 内点コーニックソルバー | `clarabel` | `clarabel 0.11` |
+
+`QpSolver` enum は `#[non_exhaustive]` であり、将来のバリアント追加（例: `Osqp`, `ProxQP`）を破壊的変更なく行える。
+
+**使用方法**:
+
+```rust
+use misarta::qp::{solve_qp, QpConfig, QpSolver};
+
+// デフォルト（ActiveSet）
+let sol = solve_qp(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, &QpConfig::default());
+
+// Clarabel を使用（要 `clarabel` feature）
+let cfg = QpConfig { solver: QpSolver::Clarabel, ..Default::default() };
+let sol = solve_qp(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, &cfg);
+```
+
+**拘束付き IK との連携**: `QpIkConfig.qp_solver` フィールドで IK 内部の QP バックエンドを選択可能。
+
 | 関数 / 型 | 説明 |
 |------|------|
-| `solve_qp(H, c, A_eq, b_eq, A_iq, b_iq, x0, config)` | 密 QP ソルバー |
-| `QpConfig` | 設定（最大反復、実行可能性トルランス、最適性トルランス） |
+| `solve_qp(H, c, A_eq, b_eq, A_iq, b_iq, x0, config)` | 密 QP ソルバー（バックエンド自動ディスパッチ） |
+| `QpSolver` | バックエンド選択 enum（`ActiveSet` / `Clarabel`） |
+| `QpConfig` | 設定（バックエンド、最大反復、実行可能性トルランス、最適性トルランス） |
 | `QpSolution` | 解（x, 目的関数値, ラグランジュ乗数, ステータス） |
 | `QpStatus` | `Optimal` / `MaxIterations` / `Infeasible` / `NumericalFailure` |
 
-**アルゴリズム**:
+**ActiveSet アルゴリズム**:
 1. Hessian の Cholesky 分解（正則化フォールバック付き）
 2. 初期実行可能点: 等式制約の最小ノルム解 + null-space 射影で不等式実行可能化
 3. アクティブセット反復:
    - Schur complement ($S = \hat{A}\, H^{-1}\, \hat{A}^T$) による KKT 系の効率的な解法
    - ステップ長計算 + ブロッキング制約の検出
    - ラグランジュ乗数検査による非アクティブ制約の除去
+
+**Clarabel バックエンド**:
+- 密行列を CSC 形式に変換し Clarabel の内点ソルバーに委譲
+- 等式拘束: `ZeroConeT`、不等式拘束: `NonnegativeConeT`
+- `clarabel` Cargo feature が無効時に `QpSolver::Clarabel` を使用するとパニック
+
+**新バックエンドの追加手順**:
+1. `QpSolver` enum に新バリアントを追加
+2. `solve_qp()` の `match` に対応アームを追加
+3. 外部依存の場合は optional dependency + feature flag を追加
 
 ### 4.29 数値微分ユーティリティ (`utils.rs`)
 

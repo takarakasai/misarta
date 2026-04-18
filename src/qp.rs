@@ -1,4 +1,4 @@
-//! Dense quadratic programming solver — primal active-set method.
+//! Dense quadratic programming solver with pluggable backends.
 //!
 //! Solves problems of the form:
 //!
@@ -8,16 +8,21 @@
 //! - $A_{eq}\, x = b_{eq}$  (equality constraints)
 //! - $A_{iq}\, x \le b_{iq}$  (inequality constraints)
 //!
-//! The Hessian $H$ must be positive definite (a tiny diagonal regularisation
-//! is added automatically when the Cholesky factorisation fails).
-//! The solver uses a **primal active-set algorithm** that is efficient for the
-//! small, dense QPs (n ≤ 50) that arise in constrained inverse kinematics.
+//! # Backends
+//!
+//! | `QpSolver` variant | Algorithm | Feature flag |
+//! |----|-------|----|
+//! | `ActiveSet` | Primal active-set (dense, self-contained) | *always available* |
+//! | `Clarabel` | Interior-point conic solver ([clarabel](https://crates.io/crates/clarabel)) | `clarabel` |
+//!
+//! The default backend is `ActiveSet`.  To use Clarabel, enable the `clarabel`
+//! Cargo feature and set `QpSolver::Clarabel` in your [`QpConfig`].
 //!
 //! # Example
 //!
 //! ```
 //! use nalgebra::{DMatrix, DVector};
-//! use misarta::qp::{solve_qp, QpConfig, QpStatus};
+//! use misarta::qp::{solve_qp, QpConfig, QpSolver, QpStatus};
 //!
 //! // min 0.5*((x₁−2)² + (x₂−2)²)  s.t.  x₁ ≤ 1, x₂ ≤ 1
 //! let h = DMatrix::identity(2, 2);
@@ -33,6 +38,24 @@
 //! ```
 
 use nalgebra::{DMatrix, DVector};
+
+// ─── Solver backend selection ───────────────────────────────────────────────
+
+/// Which QP solver backend to use.
+///
+/// New variants can be added here (e.g. `Osqp`, `Proxqp`) to extend the set
+/// of available solvers without breaking existing code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum QpSolver {
+    /// Built-in primal active-set method (dense, no external dependencies).
+    /// Efficient for the small QPs (n ≤ 50) typical in constrained IK.
+    #[default]
+    ActiveSet,
+    /// Clarabel interior-point conic solver.
+    /// Requires the `clarabel` Cargo feature.
+    Clarabel,
+}
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -70,6 +93,8 @@ pub struct QpSolution {
 /// Configuration parameters for [`solve_qp`].
 #[derive(Debug, Clone)]
 pub struct QpConfig {
+    /// Which solver backend to use.
+    pub solver: QpSolver,
     /// Maximum active-set iterations.
     pub max_iters: usize,
     /// Tolerance for constraint feasibility checks.
@@ -81,6 +106,7 @@ pub struct QpConfig {
 impl Default for QpConfig {
     fn default() -> Self {
         Self {
+            solver: QpSolver::default(),
             max_iters: 500,
             feasibility_tol: 1e-10,
             optimality_tol: 1e-8,
@@ -88,9 +114,9 @@ impl Default for QpConfig {
     }
 }
 
-// ─── Solver ─────────────────────────────────────────────────────────────────
+// ─── Solver (dispatch) ──────────────────────────────────────────────────────
 
-/// Solve a dense QP with the primal active-set method.
+/// Solve a dense QP, dispatching to the backend specified in `config.solver`.
 ///
 /// # Arguments
 ///
@@ -100,10 +126,42 @@ impl Default for QpConfig {
 ///   Pass `None` for both when there are no equalities.
 /// * `a_iq`, `b_iq` — Inequality constraints $A_{iq} x \le b_{iq}$.
 ///   Pass `None` for both when there are no inequalities.
-/// * `x0` — Optional initial feasible point.  When `None` the solver tries
-///   $x = 0$ (no equalities) or the least-norm equality-feasible point.
-/// * `config` — Solver parameters.
+/// * `x0` — Optional initial feasible point (used only by `ActiveSet`).
+/// * `config` — Solver parameters (includes backend selection).
 pub fn solve_qp(
+    h: &DMatrix<f64>,
+    c: &DVector<f64>,
+    a_eq: Option<&DMatrix<f64>>,
+    b_eq: Option<&DVector<f64>>,
+    a_iq: Option<&DMatrix<f64>>,
+    b_iq: Option<&DVector<f64>>,
+    x0: Option<&DVector<f64>>,
+    config: &QpConfig,
+) -> QpSolution {
+    match config.solver {
+        QpSolver::ActiveSet => {
+            solve_qp_active_set(h, c, a_eq, b_eq, a_iq, b_iq, x0, config)
+        }
+        QpSolver::Clarabel => {
+            #[cfg(feature = "clarabel")]
+            {
+                solve_qp_clarabel(h, c, a_eq, b_eq, a_iq, b_iq, config)
+            }
+            #[cfg(not(feature = "clarabel"))]
+            {
+                panic!(
+                    "QpSolver::Clarabel requires the `clarabel` Cargo feature.\n\
+                     Add `misarta = {{ features = [\"clarabel\"] }}` to your Cargo.toml."
+                );
+            }
+        }
+    }
+}
+
+// ─── Active-set backend ─────────────────────────────────────────────────────
+
+/// Built-in primal active-set QP solver.
+fn solve_qp_active_set(
     h: &DMatrix<f64>,
     c: &DVector<f64>,
     a_eq: Option<&DMatrix<f64>>,
@@ -454,6 +512,174 @@ fn make_sol(
     }
 }
 
+// ─── Clarabel backend ───────────────────────────────────────────────────────
+
+/// Clarabel interior-point conic solver backend.
+///
+/// Converts the dense QP to the Clarabel native format:
+/// - Hessian `P` as upper-triangular CscMatrix
+/// - Constraint matrix `A` stacks equality rows ($A_{eq} x = b_{eq}$) and
+///   inequality rows ($A_{iq} x \le b_{iq}$)
+/// - Cone spec: `ZeroConeT` for equalities, `NonnegativeConeT` for
+///   inequalities (slack form)
+#[cfg(feature = "clarabel")]
+fn solve_qp_clarabel(
+    h: &DMatrix<f64>,
+    c: &DVector<f64>,
+    a_eq: Option<&DMatrix<f64>>,
+    b_eq: Option<&DVector<f64>>,
+    a_iq: Option<&DMatrix<f64>>,
+    b_iq: Option<&DVector<f64>>,
+    config: &QpConfig,
+) -> QpSolution {
+    use clarabel::algebra::CscMatrix;
+    use clarabel::solver::{
+        DefaultSettings, DefaultSettingsBuilder, DefaultSolver, IPSolver,
+        SolverStatus, SupportedConeT,
+    };
+
+    let n = h.nrows();
+    let (ae, be) = unpack_pair(a_eq, b_eq, n, "a_eq / b_eq");
+    let (ai, bi) = unpack_pair(a_iq, b_iq, n, "a_iq / b_iq");
+    let m_eq = ae.nrows();
+    let m_iq = ai.nrows();
+    let m_total = m_eq + m_iq;
+
+    // ── Build Hessian P (upper-triangular CSC) ──────────────────────
+    let p = dense_to_csc_upper(h);
+
+    // ── Build linear cost q ─────────────────────────────────────────
+    let q: Vec<f64> = c.iter().copied().collect();
+
+    // ── Build constraint matrix A (CSC) ─────────────────────────────
+    //   [  A_eq  ]        [  b_eq  ]
+    //   [  A_iq  ]  x ≤   [  b_iq  ]
+    //
+    // Clarabel standard form:  A x + s = b,  s ∈ K
+    //   ZeroConeT(m_eq)         : s = 0  →  A_eq x = b_eq
+    //   NonnegativeConeT(m_iq)  : s ≥ 0  →  b_iq - A_iq x ≥ 0  →  A_iq x ≤ b_iq
+    let mut a_dense = DMatrix::zeros(m_total, n);
+    let mut b_vec = Vec::with_capacity(m_total);
+
+    for i in 0..m_eq {
+        for j in 0..n {
+            a_dense[(i, j)] = ae[(i, j)];
+        }
+        b_vec.push(be[i]);
+    }
+    for i in 0..m_iq {
+        for j in 0..n {
+            a_dense[(m_eq + i, j)] = ai[(i, j)];
+        }
+        b_vec.push(bi[i]);
+    }
+
+    let a_csc = dense_to_csc_full(&a_dense);
+
+    // ── Cone specification ──────────────────────────────────────────
+    let mut cones: Vec<SupportedConeT<f64>> = Vec::new();
+    if m_eq > 0 {
+        cones.push(SupportedConeT::ZeroConeT(m_eq));
+    }
+    if m_iq > 0 {
+        cones.push(SupportedConeT::NonnegativeConeT(m_iq));
+    }
+
+    // ── Solver settings ─────────────────────────────────────────────
+    let settings = DefaultSettingsBuilder::default()
+        .max_iter(config.max_iters as u32)
+        .tol_gap_abs(config.optimality_tol)
+        .tol_gap_rel(config.optimality_tol)
+        .tol_feas(config.feasibility_tol)
+        .verbose(false)
+        .build()
+        .unwrap_or_else(|_| DefaultSettings::default());
+
+    // ── Solve ───────────────────────────────────────────────────────
+    let mut solver = DefaultSolver::new(&p, &q, &a_csc, &b_vec, &cones, settings)
+        .expect("Clarabel: failed to construct solver (bad problem dimensions?)");
+    solver.solve();
+
+    let status = match solver.solution.status {
+        SolverStatus::Solved | SolverStatus::AlmostSolved => QpStatus::Optimal,
+        SolverStatus::MaxIterations => QpStatus::MaxIterations,
+        SolverStatus::PrimalInfeasible
+        | SolverStatus::DualInfeasible
+        | SolverStatus::AlmostPrimalInfeasible
+        | SolverStatus::AlmostDualInfeasible => QpStatus::Infeasible,
+        _ => QpStatus::NumericalFailure,
+    };
+
+    let x = DVector::from_vec(solver.solution.x.clone());
+
+    // Extract multipliers from the dual variable z.
+    // Clarabel dual z has length m_total = m_eq + m_iq.
+    let z = &solver.solution.z;
+    let mut lam_eq = DVector::zeros(m_eq);
+    let mut lam_iq = DVector::zeros(m_iq);
+    for i in 0..m_eq {
+        lam_eq[i] = z[i];
+    }
+    for i in 0..m_iq {
+        // Clarabel dual for NonnegativeCone: λ ≥ 0 for the slack constraint.
+        lam_iq[i] = z[m_eq + i].max(0.0);
+    }
+
+    let obj = 0.5 * x.dot(&(h * &x)) + c.dot(&x);
+    QpSolution {
+        x,
+        objective: obj,
+        lambda_eq: lam_eq,
+        lambda_iq: lam_iq,
+        status,
+        iterations: solver.solution.iterations as usize,
+    }
+}
+
+/// Convert a dense (n×n) matrix to upper-triangular CscMatrix for Clarabel.
+#[cfg(feature = "clarabel")]
+fn dense_to_csc_upper(m: &DMatrix<f64>) -> clarabel::algebra::CscMatrix<f64> {
+    let n = m.nrows();
+    let mut col_ptr = vec![0usize; n + 1];
+    let mut row_idx = Vec::new();
+    let mut vals = Vec::new();
+
+    for j in 0..n {
+        for i in 0..=j {
+            let v = m[(i, j)];
+            if v.abs() > 1e-15 {
+                row_idx.push(i);
+                vals.push(v);
+            }
+        }
+        col_ptr[j + 1] = row_idx.len();
+    }
+
+    clarabel::algebra::CscMatrix::new(n, n, col_ptr, row_idx, vals)
+}
+
+/// Convert a dense (m×n) matrix to full CscMatrix for Clarabel.
+#[cfg(feature = "clarabel")]
+fn dense_to_csc_full(m: &DMatrix<f64>) -> clarabel::algebra::CscMatrix<f64> {
+    let (rows, cols) = m.shape();
+    let mut col_ptr = vec![0usize; cols + 1];
+    let mut row_idx = Vec::new();
+    let mut vals = Vec::new();
+
+    for j in 0..cols {
+        for i in 0..rows {
+            let v = m[(i, j)];
+            if v.abs() > 1e-15 {
+                row_idx.push(i);
+                vals.push(v);
+            }
+        }
+        col_ptr[j + 1] = row_idx.len();
+    }
+
+    clarabel::algebra::CscMatrix::new(rows, cols, col_ptr, row_idx, vals)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -778,5 +1004,130 @@ mod tests {
         assert_eq!(sol.status, QpStatus::Optimal);
         assert_relative_eq!(sol.x[0], 0.5, epsilon = 1e-6);
         assert_relative_eq!(sol.x[1], -0.5, epsilon = 1e-6);
+    }
+
+    // ── Clarabel cross-validation tests ─────────────────────────────
+
+    /// Helper: solve the same QP with both ActiveSet and Clarabel and compare.
+    #[cfg(feature = "clarabel")]
+    fn cross_validate(
+        h: &DMatrix<f64>,
+        c: &DVector<f64>,
+        a_eq: Option<&DMatrix<f64>>,
+        b_eq: Option<&DVector<f64>>,
+        a_iq: Option<&DMatrix<f64>>,
+        b_iq: Option<&DVector<f64>>,
+        x0: Option<&DVector<f64>>,
+        tol: f64,
+    ) {
+        let cfg_as = QpConfig { solver: QpSolver::ActiveSet, ..Default::default() };
+        let cfg_cl = QpConfig { solver: QpSolver::Clarabel, ..Default::default() };
+        let sol_as = solve_qp(h, c, a_eq, b_eq, a_iq, b_iq, x0, &cfg_as);
+        let sol_cl = solve_qp(h, c, a_eq, b_eq, a_iq, b_iq, None, &cfg_cl);
+        assert_eq!(sol_as.status, QpStatus::Optimal, "ActiveSet not Optimal");
+        assert_eq!(sol_cl.status, QpStatus::Optimal, "Clarabel not Optimal");
+        assert_relative_eq!(sol_as.objective, sol_cl.objective, epsilon = tol);
+        for i in 0..sol_as.x.len() {
+            assert_relative_eq!(sol_as.x[i], sol_cl.x[i], epsilon = tol);
+        }
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_unconstrained() {
+        let h = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 2.0]);
+        let c = DVector::from_vec(vec![-3.0, -1.0]);
+        cross_validate(&h, &c, None, None, None, None, None, 1e-6);
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_inequality_active() {
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::from_vec(vec![-2.0, -2.0]);
+        let a_iq = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let b_iq = DVector::from_vec(vec![1.0, 1.0]);
+        cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, 1e-6);
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_equality_only() {
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::zeros(2);
+        let a_eq = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
+        let b_eq = DVector::from_element(1, 1.0);
+        cross_validate(&h, &c, Some(&a_eq), Some(&b_eq), None, None, None, 1e-6);
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_equality_and_inequality() {
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::zeros(2);
+        let a_eq = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
+        let b_eq = DVector::from_element(1, 2.0);
+        let a_iq = DMatrix::from_row_slice(1, 2, &[1.0, 0.0]);
+        let b_iq = DVector::from_element(1, 0.5);
+        cross_validate(
+            &h, &c,
+            Some(&a_eq), Some(&b_eq),
+            Some(&a_iq), Some(&b_iq),
+            None,
+            1e-6,
+        );
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_box_constraints() {
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::from_vec(vec![-5.0, 3.0]);
+        let a_iq = DMatrix::from_row_slice(4, 2, &[
+            1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0,
+        ]);
+        let b_iq = DVector::from_vec(vec![2.0, 2.0, 1.0, 1.0]);
+        cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, 1e-6);
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_larger_problem() {
+        let n = 5;
+        let h = DMatrix::identity(n, n);
+        let c = DVector::zeros(n);
+        let mut rows = Vec::new();
+        let mut sum_row = vec![0.0; n];
+        for v in &mut sum_row { *v = -1.0; }
+        rows.push((sum_row, -5.0));
+        for i in 0..n {
+            let mut r_u = vec![0.0; n]; r_u[i] = 1.0;
+            rows.push((r_u, 3.0));
+            let mut r_l = vec![0.0; n]; r_l[i] = -1.0;
+            rows.push((r_l, 0.0));
+        }
+        let m = rows.len();
+        let mut a_data = Vec::with_capacity(m * n);
+        let mut b_data = Vec::with_capacity(m);
+        for (r, b_val) in &rows {
+            a_data.extend_from_slice(r);
+            b_data.push(*b_val);
+        }
+        let a_iq = DMatrix::from_row_slice(m, n, &a_data);
+        let b_iq = DVector::from_vec(b_data);
+        let x0 = DVector::from_element(n, 1.0); // feasible start: sum=5
+        cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), Some(&x0), 1e-5);
+    }
+
+    #[cfg(feature = "clarabel")]
+    #[test]
+    fn clarabel_non_identity_hessian() {
+        let h = DMatrix::from_row_slice(2, 2, &[3.0, 1.0, 1.0, 1.0]);
+        let c = DVector::from_vec(vec![-1.0, 0.0]);
+        let a_iq = DMatrix::from_row_slice(4, 2, &[
+            1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0,
+        ]);
+        let b_iq = DVector::from_vec(vec![1.0, 1.0, 1.0, 1.0]);
+        cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, 1e-6);
     }
 }

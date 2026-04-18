@@ -792,6 +792,8 @@ pub struct QpIkConfig {
     pub max_step: Option<f64>,
     /// Maximum active-set iterations inside each QP solve.
     pub qp_max_iters: usize,
+    /// Which QP solver backend to use.
+    pub qp_solver: crate::qp::QpSolver,
 }
 
 impl Default for QpIkConfig {
@@ -806,6 +808,7 @@ impl Default for QpIkConfig {
             joint_limits: None,
             max_step: None,
             qp_max_iters: 200,
+            qp_solver: crate::qp::QpSolver::default(),
         }
     }
 }
@@ -956,6 +959,7 @@ pub fn solve_constrained_ik_qp(
     let mut last_err = f64::INFINITY;
 
     let qp_cfg = QpConfig {
+        solver: config.qp_solver,
         max_iters: config.qp_max_iters,
         ..Default::default()
     };
@@ -1045,6 +1049,7 @@ pub fn solve_task_with_constraints_qp(
     let mut last_constraint_err = f64::INFINITY;
 
     let qp_cfg = QpConfig {
+        solver: config.qp_solver,
         max_iters: config.qp_max_iters,
         ..Default::default()
     };
@@ -1161,6 +1166,7 @@ pub fn solve_frame_task_with_constraints_qp(
     let mut last_constraint_err = f64::INFINITY;
 
     let qp_cfg = QpConfig {
+        solver: config.qp_solver,
         max_iters: config.qp_max_iters,
         ..Default::default()
     };
