@@ -19,10 +19,12 @@
 //!     shape: GeometryShape::Box { x: 0.2, y: 0.2, z: 0.1 },
 //!     mesh_path: None,
 //!     mesh_scale: None,
+//!     mesh_data: None,
 //! });
 //! assert_eq!(gmodel.num_objects(), 1);
 //! ```
 
+use crate::mesh::MeshData;
 use crate::se3::SE3;
 use nalgebra::Vector3;
 
@@ -45,7 +47,10 @@ pub enum GeometryShape {
     /// Cone along Z.
     Cone { radius: f64, length: f64 },
     /// External mesh file (STL, OBJ, DAE, …).
-    /// The actual mesh data is not loaded — only the path is stored.
+    ///
+    /// The path is always stored.  Call [`MeshData::from_stl`] and attach
+    /// the result to [`GeometryObject::mesh_data`] to make the mesh
+    /// available for collision and rendering.
     Mesh {
         filename: String,
         scale: Vector3<f64>,
@@ -71,6 +76,10 @@ pub struct GeometryObject {
     pub mesh_path: Option<String>,
     /// Mesh scale factor, if specified.
     pub mesh_scale: Option<Vector3<f64>>,
+    /// Loaded triangle-mesh data (populated when `shape` is `Mesh` and the
+    /// file was successfully read).  Used for collision detection and
+    /// rendering.
+    pub mesh_data: Option<MeshData>,
 }
 
 // ─── Geometry model ─────────────────────────────────────────────────────────
@@ -94,6 +103,7 @@ pub struct GeometryObject {
 ///     shape: GeometryShape::Box { x: 1.0, y: 1.0, z: 1.0 },
 ///     mesh_path: None,
 ///     mesh_scale: None,
+///     mesh_data: None,
 /// });
 /// assert_eq!(visual.num_objects(), 1);
 /// assert_eq!(visual.objects[0].name, "box_visual");
@@ -167,6 +177,7 @@ mod tests {
             },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         assert_eq!(idx, 0);
         assert_eq!(gm.num_objects(), 1);
@@ -184,6 +195,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.1 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -195,6 +207,7 @@ mod tests {
             },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "c".into(),
@@ -206,6 +219,7 @@ mod tests {
             },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         assert_eq!(gm.objects_for_joint(0), vec![0, 2]);

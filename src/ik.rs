@@ -859,6 +859,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.1 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         // Link 2 geometry (small sphere at joint 2)
         gm.add(GeometryObject {
@@ -868,6 +869,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.1 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let target = Vector3::new(0.5, 0.8, 0.0);
@@ -918,6 +920,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.8 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -926,6 +929,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.8 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let acm = AllowedCollisionMatrix::from_adjacent_links(&model, &gm);

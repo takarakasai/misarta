@@ -10,6 +10,7 @@ description = "Rigid body kinematics and dynamics for articulated robots"
 nalgebra = "0.34.2"
 parry3d = { package = "parry3d-f64", version = "0.25" }
 roxmltree = "0.20"
+stl_io = "0.11"
 
 [dev-dependencies]
 num-dual = "0.10"

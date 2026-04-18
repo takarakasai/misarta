@@ -15,7 +15,8 @@
 //! The original `ignore_adjacent_links: bool` API is preserved unchanged.
 
 use crate::fk::forward_kinematics;
-use crate::geometry::{GeometryModel, GeometryShape};
+use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
+use crate::mesh::MeshData;
 use crate::model::Model;
 use std::collections::HashSet;
 
@@ -109,8 +110,8 @@ fn z_axis_to_y_axis_rotation() -> UnitQuaternion<f64> {
     UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::FRAC_PI_2)
 }
 
-fn shape_to_parry(shape: &GeometryShape) -> Option<(SharedShape, Isometry3<f64>)> {
-    match shape {
+fn shape_to_parry(obj: &GeometryObject) -> Option<(SharedShape, Isometry3<f64>)> {
+    match &obj.shape {
         GeometryShape::Box { x, y, z } => {
             let hx = x * 0.5;
             let hy = y * 0.5;
@@ -147,9 +148,17 @@ fn shape_to_parry(shape: &GeometryShape) -> Option<(SharedShape, Isometry3<f64>)
                 Isometry3::from_parts(Translation3::identity(), rot),
             ))
         }
-        GeometryShape::Mesh { .. } => {
-            // GeometryShape::Mesh stores only a file path; mesh vertices are not available.
-            None
+        GeometryShape::Mesh { scale, .. } => {
+            // Use loaded mesh data if available.
+            if let Some(md) = &obj.mesh_data {
+                let scaled = md.scaled(scale);
+                match scaled.to_shared_shape() {
+                    Ok(shape) => Some((shape, Isometry3::identity())),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
         }
     }
 }
@@ -166,7 +175,7 @@ fn build_collision_objects(
         if obj.parent_joint >= data.oMi.len() {
             continue;
         }
-        if let Some((shape, local_shape_pose)) = shape_to_parry(&obj.shape) {
+        if let Some((shape, local_shape_pose)) = shape_to_parry(obj) {
             let world_pose = data.oMi[obj.parent_joint] * obj.placement * local_shape_pose;
             objects.push(CollisionObject {
                 index: i,
@@ -462,6 +471,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         gm.add(GeometryObject {
@@ -471,6 +481,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -490,6 +501,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.4 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         gm.add(GeometryObject {
@@ -499,6 +511,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.4 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -518,6 +531,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.5 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         gm.add(GeometryObject {
@@ -527,6 +541,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.5 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -548,6 +563,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -556,6 +572,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -579,6 +596,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "link2_geom".into(),
@@ -587,6 +605,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -623,6 +642,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.8 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -631,6 +651,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.8 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -651,6 +672,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -659,6 +681,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -683,6 +706,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "b".into(),
@@ -691,6 +715,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 1.0 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -710,6 +735,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.5 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -718,6 +744,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.5 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0];
@@ -737,6 +764,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.5 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -745,6 +773,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.5 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0]; // distance = 0.5
@@ -763,6 +792,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.1 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
         gm.add(GeometryObject {
             name: "s2".into(),
@@ -771,6 +801,7 @@ mod tests {
             shape: GeometryShape::Sphere { radius: 0.1 },
             mesh_path: None,
             mesh_scale: None,
+            mesh_data: None,
         });
 
         let q = vec![0.0]; // distance = 1.5 - 0.2 = 1.3

@@ -135,6 +135,7 @@ pub fn load_sdf_geometry_string(
                     shape,
                     mesh_path,
                     mesh_scale,
+                    mesh_data: None,
                 });
             }
         }
@@ -159,6 +160,7 @@ pub fn load_sdf_geometry_string(
                     shape,
                     mesh_path,
                     mesh_scale,
+                    mesh_data: None,
                 });
             }
         }
