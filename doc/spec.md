@@ -6,8 +6,8 @@
 - **名前の由来**: misa (Misato) + art (Articulation) + ta (Takara)
 - **配置**: `articara/misarta/`（独立した Cargo クレート）
 - **依存**: `nalgebra 0.34`（行列演算）、`parry3d-f64`（衝突検出）、`num-dual 0.10`（自動微分、dev-dependencies）
-- **総ソース行数**: 約 12,800 行（テスト含む）
-- **テスト数**: **243 件**（全パス）
+- **総ソース行数**: 約 19,000 行（テスト含む）
+- **テスト数**: **343 件**（全パス）
 
 ---
 
@@ -74,19 +74,24 @@ Pinocchio と同じく、不変のロボット記述（`Model`）と可変の計
 | `src/centroidal.rs` | 548 | 重心・セントロイダルモメンタム（CoM, CMM, $\dot{A}_G$, 運動量変化率） |
 | `src/constrained.rs` | 342 | 拘束付き前向き動力学 + 衝撃動力学 |
 | `src/frames.rs` | 409 | 操作空間フレーム（任意の名前付きフレーム配置・ヤコビアン） |
-| `src/collision.rs` | 780 | 衝突検出（parry3d ベース、ACM、ポテンシャル場） |
-| `src/ik.rs` | 938 | 逆運動学ソルバー（位置/姿勢/ポーズ/マルチタスク/干渉回避） |
+| `src/collision.rs` | 832 | 衝突検出（parry3d ベース、ACM、ポテンシャル場） |
+| `src/ik.rs` | 946 | 逆運動学ソルバー（位置/姿勢/ポーズ/マルチタスク/干渉回避） |
 | `src/manifold.rs` | 296 | 構成空間多様体操作（integrate, difference, interpolate） |
 | `src/limits.rs` | 166 | 関節制限（位置/速度/トルク クランプ） |
 | `src/optimization.rs` | 1384 | 最適化 API（iLQR ソルバー、離散動力学線形化、2次コスト近似） |
 | `src/trajectory.rs` | 319 | 軌道補間（線形、3次 Hermite、5次、B-スプライン） |
 | `src/kinematics_utils.rs` | 394 | 運動学ユーティリティ（フレーム間距離、セグメント間最近点等） |
-| `src/geometry.rs` | 245 | ジオメトリモデル（Box / Sphere / Cylinder / Capsule / Cone / Mesh） |
-| `src/urdf.rs` | 959 | URDF パーサー / ライター（ジオメトリ対応） |
-| `src/sdf.rs` | 989 | SDF パーサー / ライター（ジオメトリ対応） |
+| `src/geometry.rs` | 269 | ジオメトリモデル（Box / Sphere / Cylinder / Capsule / Cone / Mesh） |
+| `src/urdf.rs` | 963 | URDF パーサー / ライター（ジオメトリ対応） |
+| `src/sdf.rs` | 993 | SDF パーサー / ライター（ジオメトリ対応） |
+| `src/mesh.rs` | 735 | メッシュ読み込み（STL、Collada 参照） |
+| `src/collada.rs` | 1255 | Collada DAE 読み書き（マテリアル・テクスチャ・サブメッシュ対応） |
+| `src/reduced.rs` | 1055 | モデルリダクション（Pinocchio `buildReducedModel` 相当） |
+| `src/constraint.rs` | 2280 | 拘束ヤコビアン・等式/不等式拘束付き IK（QP ベース） |
+| `src/qp.rs` | 782 | 密 QP ソルバー（プライマル・アクティブセット法） |
 | `src/utils.rs` | 321 | 数値微分ユーティリティ（ヤコビアン、ヘッシアン） |
-| `src/lib.rs` | 25 | モジュール登録（25 モジュール） |
-| **合計** | **~12,800** | |
+| `src/lib.rs` | 30 | モジュール登録（30 モジュール） |
+| **合計** | **~19,000** | |
 
 ---
 
@@ -474,7 +479,113 @@ pub fn solve_ilqr(
 | `write_sdf` / `write_sdf_string` | `Model` → SDF 出力 |
 | `write_sdf_geometry_string` | ジオメトリ付き SDF 出力 |
 
-### 4.24 数値微分ユーティリティ (`utils.rs`)
+### 4.24 メッシュ (`mesh.rs`)
+
+STL バイナリ/ASCII メッシュの読み込み。Collada DAE への参照パスサポート。
+
+| 関数 | 説明 |
+|------|------|
+| `load_stl` | STL ファイルからメッシュ読み込み |
+| `Mesh` | 頂点・面・法線データの構造体 |
+
+### 4.25 Collada DAE (`collada.rs`)
+
+Collada 1.4.1 フォーマットの読み書き。
+
+| 関数 | 説明 |
+|------|------|
+| `read_collada` / `read_collada_string` | Collada ファイル / 文字列からメッシュ読み込み |
+| `write_collada` / `write_collada_string` | メッシュ→ Collada 出力 |
+
+対応: マテリアル（diffuse / specular）、テクスチャ参照、サブメッシュ、`<polylist>` / `<triangles>`。
+
+### 4.26 モデルリダクション (`reduced.rs`)
+
+Pinocchio の `buildReducedModel` に相当する機能。指定した関節を固定値でロックし、自由度を削減した小さなモデルを生成する。
+
+| 関数 | 説明 |
+|------|------|
+| `build_reduced_model(model, joints, q_lock)` | 指定関節をロックした縮退モデル生成 |
+| `build_reduced_model_with_geometry(model, vis, col, joints, q_lock)` | ジオメトリ付き縮退モデル |
+| `reduce_frame_model(frame_model, model, joints, q_lock)` | フレームモデルの縮退 |
+
+**アルゴリズム**:
+1. ロック関節の $M_J(q_{\text{lock}})$ を子の配置に吸収
+2. ロックされた関節の慣性を **平行軸の定理** で親に統合
+3. インデックスのリマッピング（`old_to_new`、`unlocked_ancestor`）
+4. ジオメトリの `parent_joint` と `placement` のリマッピング
+
+**検証内容**: FK 一致性（ゼロ/非ゼロ/連続ロック）、慣性マージ、総質量保存、重力トルク一致性、質量行列次元、ABA 一致性、FreeFlyer ロック、パニック条件
+
+### 4.27 拘束ヤコビアン・拘束付き IK (`constraint.rs`)
+
+Pinocchio 互換の拘束ヤコビアンフレームワーク。ループ閉鎖、クロスブランチ IK、相対姿勢拘束を提供する。
+
+**型**:
+
+| 型 | 説明 |
+|------|------|
+| `ConstraintType` | `Contact6D`（6行）/ `Contact3D`（3行） |
+| `ReferenceFrame` | `World` / `Local`（frame1 ローカル） |
+| `RigidConstraint<T>` | 2 フレーム間の剛体拘束 |
+| `ConstraintModel<T>` | 拘束のコレクション |
+| `ConstrainedIkConfig` | DLS ベース拘束 IK 設定 |
+| `QpIkConfig` | QP ベース不等式拘束 IK 設定 |
+| `ConstrainedIkResult` | ソルバー結果（q, 反復数, 誤差, 収束フラグ） |
+
+**拘束誤差**:
+
+$$e_{6D} = \log\bigl(M_1^{-1}\, M_2\, M_{\text{des}}^{-1}\bigr), \quad e_{3D} = p_2 - (p_1 + R_1\, t_{\text{des}})$$
+
+**拘束ヤコビアン**:
+
+$$J_c = J_2 - J_1$$
+
+| 関数 | 説明 |
+|------|------|
+| `compute_constraint_error` | 拘束誤差ベクトルの計算 |
+| `compute_constraint_jacobian` | 拘束ヤコビアンの計算 |
+| `solve_constrained_ik` | 拘束のみ IK（DLS） |
+| `solve_task_with_constraints` | 位置タスク + 等式拘束 IK（拡張ヤコビアン） |
+| `solve_frame_task_with_constraints` | 6D フレームタスク + 等式拘束 IK |
+
+**QP ベース不等式拘束 IK**:
+
+等式拘束と不等式拘束（関節リミット、ステップ制限）を同時に扱う IK ソルバー。各反復で以下の QP を解く:
+
+$$\min_{dq} \lVert J_t\, dq - e_t\rVert^2 + w^2 \lVert J_c\, dq + e_c\rVert^2 + \lambda^2 \lVert dq\rVert^2 \quad \text{s.t.} \quad A_{iq}\, dq \le b_{iq}$$
+
+| 関数 | 説明 |
+|------|------|
+| `build_joint_limit_inequalities` | 関節リミット→不等式行列 |
+| `build_max_step_inequalities` | ステップ制限→不等式行列 |
+| `stack_inequalities` | 不等式のスタック結合 |
+| `solve_constrained_ik_qp` | 拘束のみ IK（QP ベース） |
+| `solve_task_with_constraints_qp` | 位置タスク + 等式 + 不等式 IK |
+| `solve_frame_task_with_constraints_qp` | 6D フレームタスク + 等式 + 不等式 IK |
+
+### 4.28 QP ソルバー (`qp.rs`)
+
+自己完結型のプライマル・アクティブセット法 QP ソルバー。外部依存なし。
+
+$$\min_x \frac{1}{2} x^T H x + c^T x \quad \text{s.t.} \quad A_{eq}\, x = b_{eq}, \quad A_{iq}\, x \le b_{iq}$$
+
+| 関数 / 型 | 説明 |
+|------|------|
+| `solve_qp(H, c, A_eq, b_eq, A_iq, b_iq, x0, config)` | 密 QP ソルバー |
+| `QpConfig` | 設定（最大反復、実行可能性トルランス、最適性トルランス） |
+| `QpSolution` | 解（x, 目的関数値, ラグランジュ乗数, ステータス） |
+| `QpStatus` | `Optimal` / `MaxIterations` / `Infeasible` / `NumericalFailure` |
+
+**アルゴリズム**:
+1. Hessian の Cholesky 分解（正則化フォールバック付き）
+2. 初期実行可能点: 等式制約の最小ノルム解 + null-space 射影で不等式実行可能化
+3. アクティブセット反復:
+   - Schur complement ($S = \hat{A}\, H^{-1}\, \hat{A}^T$) による KKT 系の効率的な解法
+   - ステップ長計算 + ブロッキング制約の検出
+   - ラグランジュ乗数検査による非アクティブ制約の除去
+
+### 4.29 数値微分ユーティリティ (`utils.rs`)
 
 | 関数 | 説明 |
 |------|------|
@@ -488,15 +599,15 @@ pub fn solve_ilqr(
 
 ## 5. テスト
 
-全 **243 テスト** が通過（0 失敗）。
+全 **343 テスト** が通過（0 失敗）。
 
 | スイート | 件数 |
 |----------|------|
-| ユニットテスト（`src/`） | 205 |
+| ユニットテスト（`src/`） | 300 |
 | 自動微分テスト（`tests/autodiff.rs`） | 4 |
 | 運動学統合テスト（`tests/kinematics.rs`） | 6 |
 | ローダーテスト（`tests/regression.rs`） | 23 |
-| Doctest | 5 |
+| Doctest | 10 |
 
 ### モジュール別テスト内訳
 
@@ -504,7 +615,7 @@ pub fn solve_ilqr(
 |-----------|------|-------------|
 | `se3` | 5 | exp/log 往復、合成、逆変換 |
 | `joint` | 4 | 各関節型の forward / motion_subspace |
-| `model` | 2 | ModelBuilder、チェーン構築 |
+| `model` | 10 | ModelBuilder、チェーン構築、approx_eq |
 | `fk` | 9 | 0 次 / 1 次 / 2 次 FK、参照透明性 |
 | `jacobian` | 17 | ワールド / ローカル / 相対 / マスク / 時間微分、FD 検証 |
 | `rnea` | 6 | 重力トルク、非線形効果、加速度の線形性 |
@@ -515,7 +626,7 @@ pub fn solve_ilqr(
 | `constrained` | 6 | 拘束付き動力学 KKT、衝撃動力学 |
 | `centroidal` | 12 | CoM、CMM、セントロイダル慣性、$\dot{A}_G$、運動量変化率 |
 | `frames` | 7 | フレーム配置、ヤコビアン |
-| `collision` | 7 | 干渉検出、ACM、ポテンシャル場 |
+| `collision` | 11 | 干渉検出、ACM、ポテンシャル場 |
 | `ik` | 10 | 位置 / 姿勢 / ポーズ / マルチタスク / 干渉回避 IK |
 | `manifold` | 8 | integrate / difference / interpolate |
 | `limits` | 3 | クランプ、飽和、射影 |
@@ -523,8 +634,13 @@ pub fn solve_ilqr(
 | `trajectory` | 8 | Hermite / 5 次 / B-スプライン |
 | `kinematics_utils` | 10 | フレーム間距離、最近点 |
 | `geometry` | 4 | ジオメトリモデル構築 |
+| `mesh` | 12 | STL メッシュ読み込み |
+| `collada` | 7 | Collada DAE 読み書き |
 | `urdf` | 15 | URDF 読み書き、ジオメトリ |
 | `sdf` | 14 | SDF 読み書き、ジオメトリ |
+| `reduced` | 27 | モデルリダクション（FK 一致性、慣性マージ、総質量保存、ABA 一致等） |
+| `constraint` | 34 | 拘束ヤコビアン、DLS/QP 拘束 IK、不等式拘束（関節リミット、ステップ制限） |
+| `qp` | 15 | QP ソルバー（無制約、等式、不等式、ボックス、混合、乗数検証） |
 | `utils` | 5 | 数値微分 |
 
 ---
@@ -570,6 +686,10 @@ pub fn solve_ilqr(
 | **フレーム** | `updateFramePlacements` | `compute_frame_placement` | ✅ |
 | | `computeFrameJacobian` | `compute_frame_jacobian` | ✅ |
 | **IK** | — | `solve_joint_*_ik` (7 種) | ✅ |
+| **拘束ヤコビアン** | `computeConstraintJacobian` | `compute_constraint_jacobian` | ✅ |
+| **拘束 IK** | — | `solve_constrained_ik`, `solve_task_with_constraints` 等 | ✅ |
+| **不等式拘束 IK** | — (QP ベース) | `solve_*_qp` (3 種) | ✅ |
+| **モデルリダクション** | `buildReducedModel` | `build_reduced_model` / `_with_geometry` | ✅ |
 | **衝突** | (FCL/HPP-FCL) | `collision_pairs`, `minimum_distance` | ✅ |
 | **多様体** | `integrate` / `difference` | `integrate` / `difference` | ✅ |
 | **URDF** | `buildModelFromUrdf` | `load_urdf` / `load_urdf_geometry` | ✅ |
@@ -618,5 +738,6 @@ pub fn solve_ilqr(
 **方針: ツリー構造 + 拘束**
 
 1. 閉ループの一辺を仮想的に切断し、ツリー構造として表現する
-2. 切断箇所に **ループ閉鎖拘束**（loop closure constraint）を定義する
-3. `constrained_forward_dynamics` で拘束力を計算し、運動方程式に組み込む
+2. 切断箇所に **ループ閉鎖拘束**（loop closure constraint）を `constraint.rs` の `RigidConstraint` で定義する
+3. `compute_constraint_jacobian` で拘束ヤコビアンを計算し、`constrained_forward_dynamics` に渡す
+4. IK は `solve_constrained_ik` / `solve_constrained_ik_qp` でループ閉鎖を保ちながら解ける
