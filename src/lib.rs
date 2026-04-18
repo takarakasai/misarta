@@ -29,3 +29,5 @@ pub mod reduced;
 pub mod constraint;
 pub mod mimic;
 pub mod qp;
+pub mod regressor;
+pub mod coriolis;

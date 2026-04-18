@@ -6,8 +6,8 @@
 - **名前の由来**: misa (Misato) + art (Articulation) + ta (Takara)
 - **配置**: `articara/misarta/`（独立した Cargo クレート）
 - **依存**: `nalgebra 0.34`（行列演算）、`parry3d-f64`（衝突検出）、`num-dual 0.10`（自動微分、dev-dependencies）
-- **総ソース行数**: 約 20,100 行（テスト含む）
-- **テスト数**: **352 件**（全パス）
+- **総ソース行数**: 約 21,200 行（テスト含む）
+- **テスト数**: **370 件**（全パス）
 
 ---
 
@@ -96,9 +96,11 @@ Pinocchio と同じく、不変のロボット記述（`Model`）と可変の計
 | └ `mod.rs` | 103 | モジュール宣言・再エクスポート |
 | `src/mimic.rs` | 368 | Mimic（連動）関節ユーティリティ（射影、射影行列、トルク射影） |
 | `src/qp.rs` | 1100+ | 密 QP ソルバー（プラグイン可能バックエンド: ActiveSet / Clarabel） |
+| `src/regressor.rs` | 661 | 慣性パラメータ・リグレッサー（$\tau = Y\pi$） |
+| `src/coriolis.rs` | 446 | コリオリ行列 $C(q, \dot{q})$ |
 | `src/utils.rs` | 321 | 数値微分ユーティリティ（ヤコビアン、ヘッシアン） |
-| `src/lib.rs` | 31 | モジュール登録（31 モジュール） |
-| **合計** | **~20,100** | |
+| `src/lib.rs` | 33 | モジュール登録（33 モジュール） |
+| **合計** | **~21,200** | |
 
 ---
 
@@ -654,7 +656,44 @@ let sol = solve_qp(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, &cfg);
 2. `solve_qp()` の `match` に対応アームを追加
 3. 外部依存の場合は optional dependency + feature flag を追加
 
-### 4.29 数値微分ユーティリティ (`utils.rs`)
+### 4.29 慣性パラメータ・リグレッサー (`regressor.rs`)
+
+Pinocchio の `computeJointTorqueRegressor` に相当する機能。RNEA が慣性パラメータに対して線形であることを利用し、リグレッサー行列 $Y$ を計算する。
+
+$$\tau = Y(q, \dot{q}, \ddot{q})\, \pi$$
+
+ここで $\pi \in \mathbb{R}^{10 n_b}$ は各リンクの慣性パラメータベクトル（質量、質量×重心 3成分、慣性テンソル上三角 6成分）を連結したもの。
+
+$$\pi_i = [m_i,\; m_i c_{x_i},\; m_i c_{y_i},\; m_i c_{z_i},\; I_{xx_i},\; I_{xy_i},\; I_{xz_i},\; I_{yy_i},\; I_{yz_i},\; I_{zz_i}]^T$$
+
+| 関数 | 説明 |
+|------|------|
+| `compute_joint_torque_regressor(model, q, v, a)` | リグレッサー $Y \in \mathbb{R}^{n_v \times 10 n_b}$ |
+| `compute_static_regressor(model, q)` | 静的リグレッサー $Y_g$ — $g(q) = Y_g \pi$ |
+| `inertia_params_from_model(model)` | `Model` → パラメータベクトル $\pi$ 抽出 |
+
+**検証**: `Y(q,v,a) \cdot \pi_{\text{model}} = \text{rnea}(q,v,a)` の一致を検証。ランダム q/v/a および多リンクモデルで数値的に確認。
+
+### 4.30 コリオリ行列 (`coriolis.rs`)
+
+コリオリ・遠心力行列 $C(q, \dot{q}) \in \mathbb{R}^{n_v \times n_v}$ を明示的に計算する。
+
+$$\tau_{\text{coriolis}} = C(q,\dot{q})\, \dot{q}$$
+
+RNEA 列展開法で実装: $j$ 列目は $\text{rnea}(q, \dot{q}, e_j) - \text{rnea}(q, \dot{q}, 0)$ として計算。ただし効率のため、非線形効果 $h = C\dot{q} + g$ からの差分ではなく、$e_j$ を加速度として渡す RNEA から重力項を差し引く。
+
+$$C_{\cdot j} = \text{rnea}(q, \dot{q}, e_j) - g(q)$$
+
+| 関数 | 説明 |
+|------|------|
+| `compute_coriolis_matrix(model, q, v)` | コリオリ行列 $C(q, \dot{q})$ |
+
+**検証**:
+- $C(q, \dot{q})\, \dot{q} = \text{nonlinear\_effects}(q, \dot{q}) - g(q)$
+- 歪対称性: $\dot{q}^T (\dot{M} - 2C) \dot{q} = 0$（パッシビティ）
+- 自動微分ヤコビアンとの一致
+
+### 4.31 数値微分ユーティリティ (`utils.rs`)
 
 | 関数 | 説明 |
 |------|------|
@@ -664,7 +703,7 @@ let sol = solve_qp(&h, &c, None, None, Some(&a_iq), Some(&b_iq), None, &cfg);
 | `numerical_gradient` | 数値勾配 |
 | `numerical_hessian` | 数値ヘッシアン |
 
-### 4.30 Mimic（連動）関節 (`mimic.rs`)
+### 4.32 Mimic（連動）関節 (`mimic.rs`)
 
 URDF の `<mimic>` タグに対応する連動関節サポート。slave 関節の構成値を master 関節からアフィン写像で決定する。
 
@@ -703,11 +742,11 @@ IK / 最適化では独立変数のみ扱い、FK 呼び出し前に `enforce_mi
 
 ## 5. テスト
 
-全 **352 テスト** が通過（0 失敗）。
+全 **370 テスト** が通過（0 失敗）。
 
 | スイート | 件数 |
 |----------|------|
-| ユニットテスト（`src/`） | 308 |
+| ユニットテスト（`src/`） | 326 |
 | 自動微分テスト（`tests/autodiff.rs`） | 4 |
 | 運動学統合テスト（`tests/kinematics.rs`） | 6 |
 | ローダーテスト（`tests/regression.rs`） | 23 |
@@ -746,6 +785,8 @@ IK / 最適化では独立変数のみ扱い、FK 呼び出し前に `enforce_mi
 | `constraint` | 34 | 拘束ヤコビアン、DLS/QP 拘束 IK、不等式拘束（関節リミット、ステップ制限） |
 | `qp` | 15 | QP ソルバー（無制約、等式、不等式、ボックス、混合、乗数検証） |
 | `mimic` | 8 | enforce_mimic、速度射影、射影行列、トルク射影、FK 連携 |
+| `regressor` | 10 | Yπ=RNEA 一致（単リンク/2/3 リンク）、静的リグレッサー、プリズマティック |
+| `coriolis` | 8 | Cv=nle-g、歪対称性、ゼロ速度、v線形性 |
 | `utils` | 5 | 数値微分 |
 
 ---
@@ -801,6 +842,8 @@ IK / 最適化では独立変数のみ扱い、FK 呼び出し前に `enforce_mi
 | **URDF mimic** | URDF `<mimic>` タグ | `MimicJoint` + `enforce_mimic` | ✅ |
 | **SDF** | `buildModelFromSdf` | `load_sdf` / `load_sdf_geometry` | ✅ |
 | **iLQR** | — (Crocoddyl) | `solve_ilqr` | ✅ |
+| **リグレッサー** | `computeJointTorqueRegressor` | `compute_joint_torque_regressor` | ✅ |
+| **コリオリ行列** | `computeCoriolisMatrix` | `compute_coriolis_matrix` | ✅ |
 
 ---
 
@@ -810,7 +853,7 @@ IK / 最適化では独立変数のみ扱い、FK 呼び出し前に `enforce_mi
 
 | 機能 | 説明 | 優先度 |
 |------|------|--------|
-| コリオリ行列 | $C(q, \dot{q})$ を明示的な行列として計算 | 中 |
+| ~~コリオリ行列~~ | ~~$C(q, \dot{q})$ を明示的な行列として計算~~ | ✅ 対応済 (4.30) |
 | 運動エネルギー微分 | $\partial KE / \partial q$ | 低 |
 
 ### 8.2 動力学微分（直接法）
@@ -835,7 +878,7 @@ IK / 最適化では独立変数のみ扱い、FK 呼び出し前に `enforce_mi
 |------|------|--------|
 | MJCF パーサー | MuJoCo XML 対応 | 低 |
 | メッシュ衝突 | TriMesh 形状の衝突検出 | 低 |
-| リグレッサー | 慣性パラメータの線形リグレッサー $Y\pi = \tau$ | 低 |
+| ~~リグレッサー~~ | ~~慣性パラメータの線形リグレッサー $Y\pi = \tau$~~ | ✅ 対応済 (4.29) |
 | CasADi 相当 | シンボリック微分・コード生成 | 低 |
 
 ### 8.5 閉リンク機構への対応方針
