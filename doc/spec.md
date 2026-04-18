@@ -6,8 +6,8 @@
 - **名前の由来**: misa (Misato) + art (Articulation) + ta (Takara)
 - **配置**: `articara/misarta/`（独立した Cargo クレート）
 - **依存**: `nalgebra 0.34`（行列演算）、`parry3d-f64`（衝突検出）、`num-dual 0.10`（自動微分、dev-dependencies）
-- **総ソース行数**: 約 19,000 行（テスト含む）
-- **テスト数**: **343 件**（全パス）
+- **総ソース行数**: 約 19,500 行（テスト含む）
+- **テスト数**: **352 件**（全パス）
 
 ---
 
@@ -62,7 +62,7 @@ Pinocchio と同じく、不変のロボット記述（`Model`）と可変の計
 |---------|-----|------|
 | `src/se3.rs` | 347 | SE(3) Lie 群ユーティリティ（同次変換、exp/log、skew、空間ベクトル変換） |
 | `src/joint.rs` | 228 | 関節型 enum（Revolute / Prismatic / Fixed / FreeFlyer）、forward / motion_subspace |
-| `src/model.rs` | 528 | ロボットモデル（`Model<T>` + `ModelBuilder`）、リンク慣性、ツリー構造 |
+| `src/model.rs` | 648 | ロボットモデル（`Model<T>` + `ModelBuilder`）、リンク慣性、ツリー構造、`MimicJoint` |
 | `src/data.rs` | 44 | 計算結果データ構造体（配置、速度、加速度、ヤコビアン） |
 | `src/fk.rs` | 496 | 順運動学（0次・1次速度付き・2次加速度付き） |
 | `src/jacobian.rs` | 765 | 幾何学的ヤコビアン（ワールド / ローカル / 相対 / マスク / 時間微分） |
@@ -82,16 +82,17 @@ Pinocchio と同じく、不変のロボット記述（`Model`）と可変の計
 | `src/trajectory.rs` | 319 | 軌道補間（線形、3次 Hermite、5次、B-スプライン） |
 | `src/kinematics_utils.rs` | 394 | 運動学ユーティリティ（フレーム間距離、セグメント間最近点等） |
 | `src/geometry.rs` | 269 | ジオメトリモデル（Box / Sphere / Cylinder / Capsule / Cone / Mesh） |
-| `src/urdf.rs` | 963 | URDF パーサー / ライター（ジオメトリ対応） |
+| `src/urdf.rs` | 1013 | URDF パーサー / ライター（ジオメトリ・mimic 対応） |
 | `src/sdf.rs` | 993 | SDF パーサー / ライター（ジオメトリ対応） |
 | `src/mesh.rs` | 735 | メッシュ読み込み（STL、Collada 参照） |
 | `src/collada.rs` | 1255 | Collada DAE 読み書き（マテリアル・テクスチャ・サブメッシュ対応） |
 | `src/reduced.rs` | 1055 | モデルリダクション（Pinocchio `buildReducedModel` 相当） |
 | `src/constraint.rs` | 2280 | 拘束ヤコビアン・等式/不等式拘束付き IK（QP ベース） |
+| `src/mimic.rs` | 368 | Mimic（連動）関節ユーティリティ（射影、射影行列、トルク射影） |
 | `src/qp.rs` | 782 | 密 QP ソルバー（プライマル・アクティブセット法） |
 | `src/utils.rs` | 321 | 数値微分ユーティリティ（ヤコビアン、ヘッシアン） |
-| `src/lib.rs` | 30 | モジュール登録（30 モジュール） |
-| **合計** | **~19,000** | |
+| `src/lib.rs` | 31 | モジュール登録（31 モジュール） |
+| **合計** | **~19,500** | |
 
 ---
 
@@ -176,8 +177,22 @@ Pinocchio 互換の関節型を `enum JointType<T>` で表現する。
 | `q_idx` / `v_idx` | `Vec<usize>` | q / v ベクトルへのインデックスマッピング |
 | `nq` / `nv` | `usize` | 全構成 / 速度次元 |
 | `gravity` | `Vector3<T>` | ワールド座標系の重力ベクトル（デフォルト $[0, 0, -9.81]$） |
+| `mimic` | `Vec<MimicJoint<T>>` | Mimic（連動）関節拘束のリスト |
 
-**`ModelBuilder`**: Builder パターンによるモデル構築。`add_joint()` でチェーン追加し、`build()` で不変 `Model` を生成。
+**`MimicJoint<T>` 構造体**
+
+URDF の `<mimic>` タグに対応する連動関節の代数的拘束。slave 関節の構成値は master 関節からアフィン写像で決定される：
+
+$$q_{\text{slave}} = m \cdot q_{\text{master}} + o$$
+
+| フィールド | 型 | 説明 |
+|-----------|------|------|
+| `slave` | `usize` | 従属関節インデックス（1-based） |
+| `master` | `usize` | 主関節インデックス（1-based） |
+| `multiplier` | `T` | ギア比 $m$ |
+| `offset` | `T` | オフセット $o$ |
+
+**`ModelBuilder`**: Builder パターンによるモデル構築。`add_joint()` でチェーン追加、`add_mimic()` で連動関節拘束追加、`build()` で不変 `Model` を生成。`from_model()` で既存モデルからビルダーを再構築。
 
 ### 4.4 計算データ (`data.rs`)
 
@@ -466,10 +481,12 @@ pub fn solve_ilqr(
 **URDF** (`urdf.rs`):
 | 関数 | 説明 |
 |------|------|
-| `load_urdf` / `load_urdf_string` | ファイル / 文字列から `Model` ロード |
+| `load_urdf` / `load_urdf_string` | ファイル / 文字列から `Model` ロード（`<mimic>` タグ対応） |
 | `load_urdf_geometry` / `load_urdf_geometry_string` | `Model` + `GeometryModel`（ビジュアル + コリジョン）ロード |
-| `write_urdf` / `write_urdf_string` | `Model` → URDF 出力 |
+| `write_urdf` / `write_urdf_string` | `Model` → URDF 出力（mimic タグ出力対応） |
 | `write_urdf_geometry_string` | ジオメトリ付き URDF 出力 |
+
+URDF の `<mimic joint="master" multiplier="m" offset="o"/>` 要素を自動的にパースし、`Model.mimic` に `MimicJoint` として格納する。ライターも `Model.mimic` から `<mimic>` タグを生成する。
 
 **SDF** (`sdf.rs`):
 | 関数 | 説明 |
@@ -595,19 +612,54 @@ $$\min_x \frac{1}{2} x^T H x + c^T x \quad \text{s.t.} \quad A_{eq}\, x = b_{eq}
 | `numerical_gradient` | 数値勾配 |
 | `numerical_hessian` | 数値ヘッシアン |
 
+### 4.30 Mimic（連動）関節 (`mimic.rs`)
+
+URDF の `<mimic>` タグに対応する連動関節サポート。slave 関節の構成値を master 関節からアフィン写像で決定する。
+
+**設計方針**: `JointType` に新バリアントを追加する方式ではなく、**`Model` にサイドバンド情報として持たせる** 方式を採用。これにより FK / RNEA / ABA / CRBA などの既存アルゴリズムは一切変更不要で、q/v ベクトルの**前処理（射影）**のみで対応する。
+
+$$q_{\text{slave}} = m \cdot q_{\text{master}} + o, \quad \dot{q}_{\text{slave}} = m \cdot \dot{q}_{\text{master}}$$
+
+| 関数 | 説明 |
+|------|------|
+| `enforce_mimic(model, q)` | q ベクトルの slave 値を master から計算し上書き |
+| `enforce_mimic_velocity(model, v)` | v ベクトルの slave 値を $m \cdot v_{\text{master}}$ で上書き |
+| `independent_q_indices(model)` | 独立（非 slave）q インデックス一覧 |
+| `independent_v_indices(model)` | 独立（非 slave）v インデックス一覧 |
+| `num_independent_v(model)` | 独立 DOF 数 |
+| `mimic_projection_matrix(model)` | 射影行列 $G \in \mathbb{R}^{n_v \times n_{\text{indep}}}$ |
+| `expand_independent_velocity(model, v_indep)` | 独立速度→全速度展開 |
+| `project_torque(model, tau)` | 全トルク→独立空間射影 $G^\top \tau$ |
+
+**射影行列 $G$**: 独立関節速度を全関節速度にマッピングする行列。
+
+$$\dot{q} = G\, \dot{q}_{\text{indep}}, \quad J_{\text{reduced}} = J \cdot G$$
+
+master が独立、slave の行は `multiplier` 倍の master 列に非零が入る。例（3 関節、j3 が j1 の mimic で multiplier=2）:
+
+$$G = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 2 & 0 \end{bmatrix}$$
+
+**ワークフロー**:
+
+```text
+q_independent ──► enforce_mimic(model, q) ──► q_full ──► FK / RNEA / ABA
+```
+
+IK / 最適化では独立変数のみ扱い、FK 呼び出し前に `enforce_mimic` で展開する。
+
 ---
 
 ## 5. テスト
 
-全 **343 テスト** が通過（0 失敗）。
+全 **352 テスト** が通過（0 失敗）。
 
 | スイート | 件数 |
 |----------|------|
-| ユニットテスト（`src/`） | 300 |
+| ユニットテスト（`src/`） | 308 |
 | 自動微分テスト（`tests/autodiff.rs`） | 4 |
 | 運動学統合テスト（`tests/kinematics.rs`） | 6 |
 | ローダーテスト（`tests/regression.rs`） | 23 |
-| Doctest | 10 |
+| Doctest | 11 |
 
 ### モジュール別テスト内訳
 
@@ -615,7 +667,7 @@ $$\min_x \frac{1}{2} x^T H x + c^T x \quad \text{s.t.} \quad A_{eq}\, x = b_{eq}
 |-----------|------|-------------|
 | `se3` | 5 | exp/log 往復、合成、逆変換 |
 | `joint` | 4 | 各関節型の forward / motion_subspace |
-| `model` | 10 | ModelBuilder、チェーン構築、approx_eq |
+| `model` | 10 | ModelBuilder、チェーン構築、approx_eq（mimic 含む） |
 | `fk` | 9 | 0 次 / 1 次 / 2 次 FK、参照透明性 |
 | `jacobian` | 17 | ワールド / ローカル / 相対 / マスク / 時間微分、FD 検証 |
 | `rnea` | 6 | 重力トルク、非線形効果、加速度の線形性 |
@@ -636,11 +688,12 @@ $$\min_x \frac{1}{2} x^T H x + c^T x \quad \text{s.t.} \quad A_{eq}\, x = b_{eq}
 | `geometry` | 4 | ジオメトリモデル構築 |
 | `mesh` | 12 | STL メッシュ読み込み |
 | `collada` | 7 | Collada DAE 読み書き |
-| `urdf` | 15 | URDF 読み書き、ジオメトリ |
+| `urdf` | 15 | URDF 読み書き、ジオメトリ、mimic |
 | `sdf` | 14 | SDF 読み書き、ジオメトリ |
 | `reduced` | 27 | モデルリダクション（FK 一致性、慣性マージ、総質量保存、ABA 一致等） |
 | `constraint` | 34 | 拘束ヤコビアン、DLS/QP 拘束 IK、不等式拘束（関節リミット、ステップ制限） |
 | `qp` | 15 | QP ソルバー（無制約、等式、不等式、ボックス、混合、乗数検証） |
+| `mimic` | 8 | enforce_mimic、速度射影、射影行列、トルク射影、FK 連携 |
 | `utils` | 5 | 数値微分 |
 
 ---
@@ -693,6 +746,7 @@ $$\min_x \frac{1}{2} x^T H x + c^T x \quad \text{s.t.} \quad A_{eq}\, x = b_{eq}
 | **衝突** | (FCL/HPP-FCL) | `collision_pairs`, `minimum_distance` | ✅ |
 | **多様体** | `integrate` / `difference` | `integrate` / `difference` | ✅ |
 | **URDF** | `buildModelFromUrdf` | `load_urdf` / `load_urdf_geometry` | ✅ |
+| **URDF mimic** | URDF `<mimic>` タグ | `MimicJoint` + `enforce_mimic` | ✅ |
 | **SDF** | `buildModelFromSdf` | `load_sdf` / `load_sdf_geometry` | ✅ |
 | **iLQR** | — (Crocoddyl) | `solve_ilqr` | ✅ |
 
@@ -721,6 +775,7 @@ $$\min_x \frac{1}{2} x^T H x + c^T x \quad \text{s.t.} \quad A_{eq}\, x = b_{eq}
 | **Spherical** ジョイント | 3-DOF 球面関節（クォータニオン / 指数座標） | 中 |
 | **Planar** ジョイント | 2-DOF 平面関節 | 低 |
 | **Universal** ジョイント | 2-DOF ユニバーサル | 低 |
+| SDF mimic | SDF ローダでの mimic/transmission 対応 | 低 |
 
 ### 8.4 その他
 
