@@ -861,6 +861,117 @@ pub fn differential_ik_step(
     }
 }
 
+// =====================================================================
+//  Multi-constraint differential IK
+// =====================================================================
+
+/// A single equality constraint for multi-constraint differential IK.
+///
+/// Each constraint contributes rows to an augmented Jacobian system.
+#[derive(Debug, Clone)]
+pub struct DiffIkConstraint {
+    /// Constraint Jacobian (m×n, same column space as primary Jacobian).
+    pub jacobian: DMatrix<f64>,
+    /// Constraint error to drive to zero (m-dimensional).
+    /// Positive = overshoot.  The solver drives `error → 0`.
+    pub error: DVector<f64>,
+    /// Weight of this constraint relative to the primary task.
+    /// Larger weight → harder constraint (but still soft).
+    pub weight: f64,
+}
+
+/// Compute one differential IK step with equality constraints (augmented Jacobian).
+///
+/// Stacks the primary 3-DoF position task with arbitrary equality constraints:
+///
+/// $$\begin{bmatrix} J_{\text{task}} \\ w_1 J_{c_1} \\ w_2 J_{c_2} \\ \vdots
+/// \end{bmatrix} \delta q
+/// = \begin{bmatrix} \text{gain} \cdot \Delta x \\ -w_1 e_{c_1} \\ -w_2 e_{c_2} \\ \vdots
+/// \end{bmatrix}$$
+///
+/// The combined system is solved with the configured solver method (DLS or JT)
+/// and joint weights.
+///
+/// # Parameters
+/// - `jac_world` — 3×n positional Jacobian for the primary task (world frame).
+/// - `ee_pos` — current EE world position.
+/// - `target_pos` — desired EE world position.
+/// - `constraints` — equality constraints to enforce simultaneously.
+/// - `config` — solver parameters (gain, damping, etc.).
+pub fn differential_ik_step_with_constraints(
+    jac_world: &DMatrix<f64>,
+    ee_pos: &Vector3<f64>,
+    target_pos: &Vector3<f64>,
+    constraints: &[DiffIkConstraint],
+    config: &DiffIkConfig,
+) -> DiffIkResult {
+    let n = jac_world.ncols();
+    let dx3 = (target_pos - ee_pos) * config.gain;
+    let error_before = (target_pos - ee_pos).norm();
+
+    // Project primary task if requested (e.g. 2-DoF screen plane)
+    let (dx_task, jac_task) = if let Some(ref proj) = config.task_projection {
+        let dx_full = DVector::from_column_slice(&[dx3.x, dx3.y, dx3.z]);
+        (proj * &dx_full, proj * jac_world)
+    } else {
+        (
+            DVector::from_column_slice(&[dx3.x, dx3.y, dx3.z]),
+            jac_world.clone(),
+        )
+    };
+
+    // Compute total rows for augmented system
+    let m_task = jac_task.nrows();
+    let m_constraints: usize = constraints.iter().map(|c| c.jacobian.nrows()).sum();
+    let m_total = m_task + m_constraints;
+
+    // Build augmented Jacobian and RHS
+    let mut jac_aug = DMatrix::<f64>::zeros(m_total, n);
+    let mut rhs_aug = DVector::<f64>::zeros(m_total);
+
+    // Primary task rows
+    jac_aug.view_mut((0, 0), (m_task, n)).copy_from(&jac_task);
+    rhs_aug.rows_mut(0, m_task).copy_from(&dx_task);
+
+    // Constraint rows
+    let mut row_offset = m_task;
+    for c in constraints {
+        let mc = c.jacobian.nrows();
+        assert_eq!(c.jacobian.ncols(), n, "Constraint Jacobian column count must match primary");
+        assert_eq!(c.error.len(), mc, "Constraint error dimension must match Jacobian rows");
+        let w = c.weight;
+        // Weighted constraint: w * J_c * dq = -w * e_c
+        for r in 0..mc {
+            for col in 0..n {
+                jac_aug[(row_offset + r, col)] = w * c.jacobian[(r, col)];
+            }
+            rhs_aug[row_offset + r] = -w * c.error[r];
+        }
+        row_offset += mc;
+    }
+
+    // Solve augmented system with configured solver
+    let tmp_config = IkConfig {
+        damping: config.damping.clone(),
+        solver_method: config.solver_method,
+        joint_weights: config.joint_weights.clone(),
+        ..IkConfig::default()
+    };
+
+    let mut dq = solver_step(&jac_aug, &rhs_aug, &tmp_config)
+        .unwrap_or_else(|| DVector::zeros(n));
+
+    // Safety clamp
+    for i in 0..n {
+        dq[i] = dq[i].clamp(-config.max_joint_step, config.max_joint_step);
+    }
+
+    DiffIkResult {
+        dq: (0..n).map(|i| dq[i]).collect(),
+        error_before,
+    }
+}
+
 /// Returns `true` if the configuration `q` has any unallowed collision.
 ///
 /// Thin convenience wrapper around [`has_collision_acm`].
@@ -1336,5 +1447,50 @@ mod tests {
         let data2 = forward_kinematics(&model, &q_new);
         let ee2 = se3::translation(&data2.oMi[2]);
         assert!((target - ee2).norm() < result.error_before);
+    }
+
+    #[test]
+    fn differential_ik_with_constraint_reduces_both_errors() {
+        // 3-link planar chain: joint 1 → link 1, joint 2 → link 2 (EE)
+        let model = two_link_planar();
+        let q = vec![0.3, -0.5];
+        let data = forward_kinematics(&model, &q);
+        let ee = se3::translation(&data.oMi[2]);
+        let mid = se3::translation(&data.oMi[1]);
+        let target = Vector3::new(0.8, 0.6, 0.0);
+
+        // Primary: move EE (joint 2) toward target
+        let jac_ee = compute_joint_jacobian(&model, &q, 2)
+            .rows(3, 3).into_owned();
+
+        // Constraint: pin midpoint (joint 1) to its current position
+        let jac_mid = compute_joint_jacobian(&model, &q, 1)
+            .rows(3, 3).into_owned();
+        let mid_error = mid - mid; // already at target → zero error
+        let constraint = DiffIkConstraint {
+            jacobian: jac_mid.clone(),
+            error: DVector::from_column_slice(&[mid_error.x, mid_error.y, mid_error.z]),
+            weight: 10.0,
+        };
+
+        let cfg = DiffIkConfig::default();
+        let result = differential_ik_step_with_constraints(
+            &jac_ee, &ee, &target, &[constraint], &cfg,
+        );
+        assert_eq!(result.dq.len(), 2);
+
+        // EE error should decrease
+        let q_new: Vec<f64> = q.iter().zip(&result.dq)
+            .map(|(qi, dqi)| qi + dqi).collect();
+        let data2 = forward_kinematics(&model, &q_new);
+        let ee2 = se3::translation(&data2.oMi[2]);
+        assert!((target - ee2).norm() < result.error_before,
+            "EE should get closer to target");
+
+        // Mid link should barely move (pinned with high weight)
+        let mid2 = se3::translation(&data2.oMi[1]);
+        let mid_drift = (mid2 - mid).norm();
+        assert!(mid_drift < 0.02,
+            "Pinned link drifted {mid_drift:.4}, expected < 0.02");
     }
 }
