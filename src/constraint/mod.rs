@@ -90,6 +90,7 @@ pub use jacobian::{
 
 pub use ik::{
     ConstrainedIkConfig, ConstrainedIkResult,
+    build_diff_ik_constraints, build_diff_ik_constraints_from_data,
     solve_constrained_ik, solve_frame_task_with_constraints,
     solve_task_with_constraints,
 };

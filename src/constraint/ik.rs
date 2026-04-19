@@ -62,6 +62,117 @@ impl Default for ConstrainedIkConfig {
 
 // ─── Solvers ────────────────────────────────────────────────────────────────
 
+// ─── Bridge: ConstraintModel → DiffIkConstraint ─────────────────────────────
+
+/// Convert a [`ConstraintModel`] into [`DiffIkConstraint`]s at the current
+/// configuration, suitable for single-step differential IK
+/// ([`differential_ik_step_with_constraints`](crate::ik::differential_ik_step_with_constraints)).
+///
+/// Returns one `DiffIkConstraint` per `RigidConstraint` in the model.
+/// Each carries its own Jacobian (3 or 6 rows × nv), error vector,
+/// and the given `weight`.
+///
+/// This is the intended bridge between the high-level constraint types
+/// (loop closures, cross-branch constraints) and the real-time single-step
+/// IK used by the GUI.
+///
+/// # Parameters
+/// - `model` — misarta kinematic model.
+/// - `q` — current joint configuration.
+/// - `cm` — constraint model (may contain multiple constraints).
+/// - `weight` — soft weight for each constraint (larger = harder).
+///
+/// # Example
+/// ```
+/// use misarta::constraint::{ConstraintModel, RigidConstraint, build_diff_ik_constraints};
+/// use misarta::{model::*, joint, se3};
+/// use misarta::frames::Frame;
+///
+/// let model = ModelBuilder::<f64>::new()
+///     .add_joint("j1", 0, joint::revolute_z(), se3::identity(), LinkInertia::zero())
+///     .add_joint("j2", 1, joint::revolute_x(), se3::identity(), LinkInertia::zero())
+///     .build();
+///
+/// let f1 = Frame { name: "a".into(), parent_joint: 1, placement: se3::identity() };
+/// let f2 = Frame { name: "b".into(), parent_joint: 2, placement: se3::identity() };
+/// let cm = ConstraintModel::from_constraints(vec![RigidConstraint::position(f1, f2)]);
+///
+/// let q = vec![0.0; model.nq];
+/// let constraints = build_diff_ik_constraints(&model, &q, &cm, 10.0);
+/// assert_eq!(constraints.len(), 1);
+/// assert_eq!(constraints[0].jacobian.nrows(), 3);
+/// assert_eq!(constraints[0].jacobian.ncols(), model.nv);
+/// ```
+pub fn build_diff_ik_constraints(
+    model: &Model<f64>,
+    q: &[f64],
+    cm: &ConstraintModel<f64>,
+    weight: f64,
+) -> Vec<crate::ik::DiffIkConstraint> {
+    if cm.is_empty() {
+        return Vec::new();
+    }
+
+    let data = forward_kinematics(model, q);
+
+    // Per-constraint Jacobian and error (splitting, not stacking)
+    let mut result = Vec::with_capacity(cm.len());
+    let stacked_err = compute_constraint_error_from_data(&data, cm);
+    let stacked_jac = compute_constraint_jacobian_from_data(model, q, &data, cm);
+
+    let nv = model.nv;
+    let mut row = 0;
+    for c in &cm.constraints {
+        let dim = c.constraint_type.dim();
+        let jac_i = stacked_jac.view((row, 0), (dim, nv)).clone_owned();
+        let err_i = stacked_err.rows(row, dim).clone_owned();
+        result.push(crate::ik::DiffIkConstraint {
+            jacobian: jac_i,
+            error: err_i,
+            weight,
+        });
+        row += dim;
+    }
+
+    result
+}
+
+/// Same as [`build_diff_ik_constraints`] but with pre-computed FK data,
+/// avoiding redundant forward-kinematics computation.
+pub fn build_diff_ik_constraints_from_data(
+    model: &Model<f64>,
+    q: &[f64],
+    data: &crate::data::Data<f64>,
+    cm: &ConstraintModel<f64>,
+    weight: f64,
+) -> Vec<crate::ik::DiffIkConstraint> {
+    if cm.is_empty() {
+        return Vec::new();
+    }
+
+    let stacked_err = compute_constraint_error_from_data(data, cm);
+    let stacked_jac = compute_constraint_jacobian_from_data(model, q, data, cm);
+
+    let nv = model.nv;
+    let mut result = Vec::with_capacity(cm.len());
+    let mut row = 0;
+    for c in &cm.constraints {
+        let dim = c.constraint_type.dim();
+        let jac_i = stacked_jac.view((row, 0), (dim, nv)).clone_owned();
+        let err_i = stacked_err.rows(row, dim).clone_owned();
+        result.push(crate::ik::DiffIkConstraint {
+            jacobian: jac_i,
+            error: err_i,
+            weight,
+        });
+        row += dim;
+    }
+
+    result
+}
+
+// ─── Iterative Solvers ──────────────────────────────────────────────────────
+
 /// Solve IK subject to rigid constraints (constraint-only, no primary task).
 ///
 /// Minimises the constraint error using DLS on the constraint Jacobian.
