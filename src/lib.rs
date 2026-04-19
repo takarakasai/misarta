@@ -31,3 +31,4 @@ pub mod mimic;
 pub mod qp;
 pub mod regressor;
 pub mod coriolis;
+pub mod config;

@@ -11,7 +11,9 @@ clarabel = { version = "0.11.1", features = ["default"], optional = true }
 nalgebra = "0.34.2"
 parry3d = { package = "parry3d-f64", version = "0.25" }
 roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
 stl_io = "0.11"
+toml = "0.8"
 
 [dev-dependencies]
 num-dual = "0.10"
