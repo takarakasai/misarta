@@ -105,8 +105,7 @@
 
 use crate::crba;
 use crate::model::Model;
-use crate::rnea;
-use nalgebra::{DMatrix, DVector, RealField};
+use nalgebra::DMatrix;
 
 /// Compute the Coriolis/centrifugal matrix C(q, v) ∈ ℝ^{nv × nv}.
 ///

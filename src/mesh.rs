@@ -260,6 +260,73 @@ impl MeshData {
         })
     }
 
+    /// Build `MeshData` from a flat interleaved `[x, y, z, nx, ny, nz, ...]`
+    /// buffer (stride 6, as used by the OpenGL renderer).
+    ///
+    /// Vertices are spatially deduplicated with an epsilon of `1e-10`.
+    pub fn from_flat_vertices_f32(flat: &[f32]) -> Self {
+        if flat.len() < 18 {
+            return Self {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+                face_normals: Vec::new(),
+                vertex_normals: Vec::new(),
+                texcoords: Vec::new(),
+                materials: Vec::new(),
+                submeshes: Vec::new(),
+            };
+        }
+
+        let eps = 1e-10_f64;
+        let inv_cell = 1.0 / eps.max(1e-12);
+        let quantise = |v: f64| -> i64 { (v * inv_cell).round() as i64 };
+
+        let mut vertex_map: std::collections::HashMap<(i64, i64, i64), u32> =
+            std::collections::HashMap::new();
+        let mut vertices: Vec<Point3<f64>> = Vec::new();
+        let mut indices: Vec<[u32; 3]> = Vec::new();
+        let mut face_normals: Vec<Vector3<f64>> = Vec::new();
+
+        let n_tris = flat.len() / 18;
+        for ti in 0..n_tris {
+            let base = ti * 18;
+            let mut tri_idx = [0u32; 3];
+
+            for k in 0..3 {
+                let vbase = base + k * 6;
+                let x = flat[vbase] as f64;
+                let y = flat[vbase + 1] as f64;
+                let z = flat[vbase + 2] as f64;
+                let key = (quantise(x), quantise(y), quantise(z));
+                let idx = vertex_map.entry(key).or_insert_with(|| {
+                    let i = vertices.len() as u32;
+                    vertices.push(Point3::new(x, y, z));
+                    i
+                });
+                tri_idx[k] = *idx;
+            }
+            indices.push(tri_idx);
+
+            // Face normal from the first vertex's stored normal
+            let nx = flat[base + 3] as f64;
+            let ny = flat[base + 4] as f64;
+            let nz = flat[base + 5] as f64;
+            let n = Vector3::new(nx, ny, nz);
+            let len = n.norm();
+            face_normals.push(if len > 1e-30 { n / len } else { Vector3::zeros() });
+        }
+
+        Self {
+            vertices,
+            indices,
+            face_normals,
+            vertex_normals: Vec::new(),
+            texcoords: Vec::new(),
+            materials: Vec::new(),
+            submeshes: Vec::new(),
+        }
+    }
+
     // ── Queries ─────────────────────────────────────────────────────────
 
     /// Number of unique vertices.

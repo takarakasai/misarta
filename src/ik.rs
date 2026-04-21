@@ -837,7 +837,7 @@ pub fn differential_ik_step(
             jac_world.clone(),
         )
     };
-    let m = jac.nrows();
+    let _m = jac.nrows();
 
     // Build a temporary IkConfig to reuse solver_step infrastructure
     let tmp_config = IkConfig {

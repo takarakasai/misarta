@@ -32,3 +32,5 @@ pub mod qp;
 pub mod regressor;
 pub mod coriolis;
 pub mod config;
+pub mod decimate;
+pub mod decompose;
