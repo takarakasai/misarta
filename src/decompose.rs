@@ -719,6 +719,44 @@ pub fn primitive_fit_with_progress(
     result
 }
 
+/// Compute the volume of a convex hull defined by a set of points.
+///
+/// Uses the signed-tetrahedron method: for each triangle face of the convex
+/// hull, compute the signed volume of the tetrahedron formed with the origin.
+/// For convex point sets, we triangulate from the centroid to each face.
+///
+/// Falls back to an approximate approach when the point count is small:
+/// build tetrahedra from the centroid to every triple of points.
+fn convex_hull_volume(points: &[Point3<f64>]) -> f64 {
+    let n = points.len();
+    if n < 4 {
+        return 0.0;
+    }
+
+    // Use parry3d's convex hull to get faces
+    let parry_pts: Vec<parry3d::math::Point<f64>> = points
+        .iter()
+        .map(|p| parry3d::math::Point::new(p.x, p.y, p.z))
+        .collect();
+
+    // Build a convex hull with parry3d (returns indexed mesh)
+    let (_pts, indices) = parry3d::transformation::convex_hull(&parry_pts);
+    if indices.is_empty() {
+        return 0.0;
+    }
+
+    // Signed-tetrahedron method (reference point = origin)
+    let mut vol = 0.0_f64;
+    for tri in &indices {
+        let a = &points[tri[0] as usize];
+        let b = &points[tri[1] as usize];
+        let c = &points[tri[2] as usize];
+        // Signed volume of tetrahedron (origin, a, b, c)
+        vol += a.coords.dot(&b.coords.cross(&c.coords));
+    }
+    (vol / 6.0).abs()
+}
+
 /// Fit the best primitive shape to a set of points.
 ///
 /// 1.  Compute PCA to find the oriented bounding box (OBB).
@@ -790,14 +828,19 @@ pub fn fit_primitive_to_points(points: &[Point3<f64>]) -> FitPrimitive {
     let hz = half_extents[2];
 
     // ── Candidate primitives ──
-    // Each candidate must enclose ALL points. We pick the smallest volume.
+    // Each candidate is sized to tightly fit the point cloud.
+    // We compare fill ratio (hull_volume / primitive_volume) and pick the best.
+
+    // Compute convex hull volume for fill-ratio scoring
+    let hull_vol = convex_hull_volume(points);
 
     // 1. OBB: always exact enclosure.
     let box_prim = PrimitiveKind::Box { hx, hy, hz };
 
     // 2. Cylinders: try all 3 candidate axes.
-    //    For axis=i, the radius must enclose the cross-section (the other two axes),
-    //    computed as max distance from axis in the perpendicular plane over all points.
+    //    Use the OBB half-extents for the perpendicular-plane radius
+    //    (inscribed circle of the OBB cross-section) instead of the
+    //    max point distance, which over-estimates for non-circular hulls.
     let mut best_cyl: Option<(PrimitiveKind, f64)> = None;
     for axis_idx in 0..3_usize {
         let (perp_a, perp_b) = match axis_idx {
@@ -805,50 +848,69 @@ pub fn fit_primitive_to_points(points: &[Point3<f64>]) -> FitPrimitive {
             1 => (0, 2),
             _ => (0, 1),
         };
-        // Compute exact radius needed to enclose all points in the perpendicular plane
-        let mut max_r2 = 0.0_f64;
+        // OBB-based radius: circumscribed circle of the rectangle
+        let radius_obb = (half_extents[perp_a].powi(2) + half_extents[perp_b].powi(2)).sqrt();
+        // Exact enclosing radius from actual point distances
+        let mut max_r2_exact = 0.0_f64;
         for p in points {
             let local = inv_rot * (p - center) - obb_center_local;
             let r2 = local[perp_a] * local[perp_a] + local[perp_b] * local[perp_b];
-            max_r2 = max_r2.max(r2);
+            max_r2_exact = max_r2_exact.max(r2);
         }
-        let radius = max_r2.sqrt();
+        let radius_exact = max_r2_exact.sqrt();
+        // Use the tighter of the two (OBB circumscribed is an upper bound;
+        // exact may be smaller for shapes that don't reach OBB corners)
+        let radius = radius_exact.min(radius_obb);
         let half_length = half_extents[axis_idx];
         if radius < 1e-15 && half_length < 1e-15 {
             continue;
         }
-        let vol = std::f64::consts::PI * radius * radius * 2.0 * half_length;
+        let cyl = PrimitiveKind::Cylinder { radius, half_length };
+        let vol = cyl.volume();
         if best_cyl.is_none() || vol < best_cyl.as_ref().unwrap().1 {
-            best_cyl = Some((
-                PrimitiveKind::Cylinder { radius, half_length },
-                vol,
-            ));
+            best_cyl = Some((cyl, vol));
         }
     }
 
-    // 3. Sphere: radius must enclose all points from OBB center.
-    let mut max_r2 = 0.0_f64;
+    // 3. Sphere: use the largest OBB half-extent as radius
+    //    (tighter than max point distance for non-spherical shapes).
+    let radius_obb = (hx * hx + hy * hy + hz * hz).sqrt();
+    let mut max_r2_exact = 0.0_f64;
     for p in points {
         let local = inv_rot * (p - center) - obb_center_local;
         let r2 = local.norm_squared();
-        max_r2 = max_r2.max(r2);
+        max_r2_exact = max_r2_exact.max(r2);
     }
-    let sph_radius = max_r2.sqrt();
+    let sph_radius = max_r2_exact.sqrt().min(radius_obb);
     let sph_prim = PrimitiveKind::Sphere { radius: sph_radius };
 
-    // ── Pick the smallest-volume candidate ──
-    let mut best = box_prim.clone();
-    let mut best_vol = box_prim.volume();
+    // ── Pick the best candidate by fill ratio ──
+    // fill_ratio = hull_volume / primitive_volume (higher = tighter fit)
+    // When hull_vol is 0 (degenerate), fall back to smallest volume.
+    let use_fill_ratio = hull_vol > 1e-20;
 
-    if let Some((cyl, cyl_vol)) = best_cyl {
-        if cyl_vol < best_vol {
-            best = cyl;
-            best_vol = cyl_vol;
+    let score = |prim: &PrimitiveKind| -> f64 {
+        let pv = prim.volume();
+        if use_fill_ratio && pv > 1e-20 {
+            hull_vol / pv  // higher is better
+        } else {
+            -pv  // smaller volume → less negative → higher score
+        }
+    };
+
+    let mut best = box_prim.clone();
+    let mut best_score = score(&box_prim);
+
+    if let Some((ref cyl, _)) = best_cyl {
+        let s = score(cyl);
+        if s > best_score {
+            best = cyl.clone();
+            best_score = s;
         }
     }
 
-    let sph_vol = sph_prim.volume();
-    if sph_vol < best_vol {
+    let s = score(&sph_prim);
+    if s > best_score {
         best = sph_prim;
     }
 

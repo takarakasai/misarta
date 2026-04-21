@@ -203,9 +203,10 @@ mod tests {
     use super::*;
     use crate::joint;
     use crate::model::{LinkInertia, ModelBuilder};
+    use crate::rnea;
     use crate::se3;
     use approx::assert_relative_eq;
-    use nalgebra::{Matrix3, Vector3};
+    use nalgebra::{DVector, Matrix3, Vector3};
 
     fn pendulum() -> Model<f64> {
         let offset = se3::from_rotation_and_translation(
