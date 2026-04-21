@@ -7,6 +7,8 @@
 //! |--------|--------|---------|-------|-------------|
 //! | [`Vhacd`](DecompositionMethod::Vhacd) | Convex hulls | ★★★ | ★★ | V-HACD volumetric convex decomposition |
 //! | [`SphereTree`](DecompositionMethod::SphereTree) | Spheres | ★★ | ★★★ | Binary sphere tree with PCA splitting |
+//! | [`PrimitiveFit`](DecompositionMethod::PrimitiveFit) | Primitives | ★★★ | ★ | V-HACD + fit Box/Cylinder/Sphere to each hull |
+//! | [`PrimitiveFitDirect`](DecompositionMethod::PrimitiveFitDirect) | 1 Primitive | ★★ | ★★★ | Fit single Box/Cylinder/Sphere directly |
 //!
 //! # Example
 //!
@@ -86,14 +88,19 @@ pub enum DecompositionMethod {
     /// Primitive fitting — V-HACD convex decomposition followed by
     /// best-fit primitive (Box / Cylinder / Sphere) for each convex hull.
     PrimitiveFit,
+
+    /// Direct primitive fitting — fit a single best-fit primitive
+    /// (Box / Cylinder / Sphere) to the entire mesh without V-HACD.
+    PrimitiveFitDirect,
 }
 
 impl DecompositionMethod {
     /// All available methods, useful for UI combo boxes.
-    pub const ALL: [DecompositionMethod; 3] = [
+    pub const ALL: [DecompositionMethod; 4] = [
         DecompositionMethod::Vhacd,
         DecompositionMethod::SphereTree,
         DecompositionMethod::PrimitiveFit,
+        DecompositionMethod::PrimitiveFitDirect,
     ];
 
     /// Short human-readable label.
@@ -101,7 +108,8 @@ impl DecompositionMethod {
         match self {
             Self::Vhacd => "V-HACD",
             Self::SphereTree => "Sphere Tree",
-            Self::PrimitiveFit => "Primitive Fit",
+            Self::PrimitiveFit => "Primitive Fit (V-HACD)",
+            Self::PrimitiveFitDirect => "Primitive Fit (Direct)",
         }
     }
 
@@ -111,6 +119,7 @@ impl DecompositionMethod {
             Self::Vhacd => "Convex decomposition — high quality, slower (parry3d V-HACD)",
             Self::SphereTree => "Sphere approximation — fast, moderate quality",
             Self::PrimitiveFit => "V-HACD + fit each hull to Box / Cylinder / Sphere",
+            Self::PrimitiveFitDirect => "Fit single Box / Cylinder / Sphere to the mesh directly (fast)",
         }
     }
 
@@ -120,6 +129,7 @@ impl DecompositionMethod {
             "vhacd" | "v-hacd" | "convex" => Self::Vhacd,
             "sphere" | "sphere_tree" | "spheretree" | "spheres" => Self::SphereTree,
             "primitive" | "primitive_fit" | "primitivefit" | "primitives" => Self::PrimitiveFit,
+            "primitive_direct" | "primitivefit_direct" | "direct" | "single" => Self::PrimitiveFitDirect,
             _ => Self::Vhacd,
         }
     }
@@ -614,6 +624,11 @@ impl MeshData {
     pub fn decompose_primitives_with(&self, params: &VhacdParams) -> Vec<FitPrimitive> {
         primitive_fit(self, params)
     }
+
+    /// Fit a single best-fit primitive to the mesh directly (no V-HACD).
+    pub fn decompose_primitive_direct(&self) -> FitPrimitive {
+        primitive_fit_direct(self)
+    }
 }
 
 // ─── Primitive Fitting ──────────────────────────────────────────────────────
@@ -717,6 +732,60 @@ pub fn primitive_fit_with_progress(
         p.store(PHASE_DONE, Ordering::Relaxed);
     }
     result
+}
+
+/// Fit a single best-fit primitive (Box / Cylinder / Sphere) to the mesh
+/// directly, without running V-HACD decomposition first.
+///
+/// This is much faster than [`primitive_fit`] and produces a single shape.
+pub fn primitive_fit_direct(mesh: &MeshData) -> FitPrimitive {
+    primitive_fit_direct_with_progress(mesh, None, None)
+}
+
+/// Like [`primitive_fit_direct`] but with progress reporting.
+pub fn primitive_fit_direct_with_progress(
+    mesh: &MeshData,
+    progress: Option<&Arc<AtomicU8>>,
+    sub_progress: Option<&Arc<AtomicU8>>,
+) -> FitPrimitive {
+    let set = |phase: u8| {
+        if let Some(p) = progress {
+            p.store(phase, Ordering::Relaxed);
+        }
+        if let Some(sp) = sub_progress {
+            sp.store(0, Ordering::Relaxed);
+        }
+    };
+
+    set(PHASE_PREPARING);
+
+    if mesh.vertices.len() < 3 {
+        set(PHASE_DONE);
+        // Not enough points — return a degenerate sphere
+        let center = if mesh.vertices.is_empty() {
+            Point3::origin()
+        } else {
+            mesh.vertices[0]
+        };
+        return FitPrimitive {
+            kind: PrimitiveKind::Sphere { radius: 0.0 },
+            center,
+            rotation: nalgebra::UnitQuaternion::identity(),
+        };
+    }
+
+    set(PHASE_BUILDING);
+    if let Some(sp) = sub_progress {
+        sp.store(50, Ordering::Relaxed);
+    }
+
+    let prim = fit_primitive_to_points(&mesh.vertices);
+
+    if let Some(sp) = sub_progress {
+        sp.store(100, Ordering::Relaxed);
+    }
+    set(PHASE_DONE);
+    prim
 }
 
 /// Compute the volume of a convex hull defined by a set of points.
@@ -841,7 +910,7 @@ pub fn fit_primitive_to_points(points: &[Point3<f64>]) -> FitPrimitive {
     //    Use the OBB half-extents for the perpendicular-plane radius
     //    (inscribed circle of the OBB cross-section) instead of the
     //    max point distance, which over-estimates for non-circular hulls.
-    let mut best_cyl: Option<(PrimitiveKind, f64)> = None;
+    let mut best_cyl: Option<(PrimitiveKind, f64, usize)> = None;
     for axis_idx in 0..3_usize {
         let (perp_a, perp_b) = match axis_idx {
             0 => (1, 2),
@@ -868,7 +937,7 @@ pub fn fit_primitive_to_points(points: &[Point3<f64>]) -> FitPrimitive {
         let cyl = PrimitiveKind::Cylinder { radius, half_length };
         let vol = cyl.volume();
         if best_cyl.is_none() || vol < best_cyl.as_ref().unwrap().1 {
-            best_cyl = Some((cyl, vol));
+            best_cyl = Some((cyl, vol, axis_idx));
         }
     }
 
@@ -900,24 +969,68 @@ pub fn fit_primitive_to_points(points: &[Point3<f64>]) -> FitPrimitive {
 
     let mut best = box_prim.clone();
     let mut best_score = score(&box_prim);
+    let mut best_cyl_axis: Option<usize> = None;
 
-    if let Some((ref cyl, _)) = best_cyl {
+    if let Some((ref cyl, _, axis_idx)) = best_cyl {
         let s = score(cyl);
         if s > best_score {
             best = cyl.clone();
             best_score = s;
+            best_cyl_axis = Some(axis_idx);
         }
     }
 
     let s = score(&sph_prim);
     if s > best_score {
         best = sph_prim;
+        best_cyl_axis = None; // not a cylinder
     }
+
+    // ── Adjust rotation for cylinder axis ──
+    // PrimitiveKind::Cylinder is defined as "aligned along local Z".
+    // If the best cylinder axis is not Z (column 2) of the PCA frame,
+    // reorder the rotation matrix columns so the chosen axis becomes Z.
+    let final_rotation = if let Some(axis_idx) = best_cyl_axis {
+        match axis_idx {
+            0 => {
+                // Cylinder along PCA X → remap: new(X,Y,Z) = old(Y,Z,X)
+                let mut m = nalgebra::Matrix3::<f64>::zeros();
+                m.set_column(0, &rot_mat.column(1));
+                m.set_column(1, &rot_mat.column(2));
+                m.set_column(2, &rot_mat.column(0));
+                // Ensure right-handed
+                if m.determinant() < 0.0 {
+                    let c0 = -m.column(0).into_owned();
+                    m.set_column(0, &c0);
+                }
+                nalgebra::UnitQuaternion::from_rotation_matrix(
+                    &nalgebra::Rotation3::from_matrix_unchecked(m),
+                )
+            }
+            1 => {
+                // Cylinder along PCA Y → remap: new(X,Y,Z) = old(Z,X,Y)
+                let mut m = nalgebra::Matrix3::<f64>::zeros();
+                m.set_column(0, &rot_mat.column(2));
+                m.set_column(1, &rot_mat.column(0));
+                m.set_column(2, &rot_mat.column(1));
+                if m.determinant() < 0.0 {
+                    let c0 = -m.column(0).into_owned();
+                    m.set_column(0, &c0);
+                }
+                nalgebra::UnitQuaternion::from_rotation_matrix(
+                    &nalgebra::Rotation3::from_matrix_unchecked(m),
+                )
+            }
+            _ => rotation, // axis_idx == 2, already along Z
+        }
+    } else {
+        rotation
+    };
 
     FitPrimitive {
         kind: best,
         center: obb_center_world,
-        rotation,
+        rotation: final_rotation,
     }
 }
 
@@ -1032,7 +1145,8 @@ mod tests {
     fn method_labels() {
         assert_eq!(DecompositionMethod::Vhacd.label(), "V-HACD");
         assert_eq!(DecompositionMethod::SphereTree.label(), "Sphere Tree");
-        assert_eq!(DecompositionMethod::PrimitiveFit.label(), "Primitive Fit");
+        assert_eq!(DecompositionMethod::PrimitiveFit.label(), "Primitive Fit (V-HACD)");
+        assert_eq!(DecompositionMethod::PrimitiveFitDirect.label(), "Primitive Fit (Direct)");
     }
 
     #[test]
@@ -1044,6 +1158,8 @@ mod tests {
         assert_eq!(DecompositionMethod::from_str_loose("sphere_tree"), DecompositionMethod::SphereTree);
         assert_eq!(DecompositionMethod::from_str_loose("primitive"), DecompositionMethod::PrimitiveFit);
         assert_eq!(DecompositionMethod::from_str_loose("primitives"), DecompositionMethod::PrimitiveFit);
+        assert_eq!(DecompositionMethod::from_str_loose("primitive_direct"), DecompositionMethod::PrimitiveFitDirect);
+        assert_eq!(DecompositionMethod::from_str_loose("direct"), DecompositionMethod::PrimitiveFitDirect);
         assert_eq!(DecompositionMethod::from_str_loose("unknown"), DecompositionMethod::Vhacd);
     }
 
@@ -1347,10 +1463,96 @@ mod tests {
     }
 
     #[test]
+    fn fit_cylinder_axis_aligned_to_world_z() {
+        // Cylinder along world Z → local Z of the fitted frame should ≈ world Z
+        let mut points = Vec::new();
+        for k in 0..20 {
+            let z = -2.0 + 4.0 * (k as f64) / 19.0;
+            for i in 0..16 {
+                let a = (i as f64) * std::f64::consts::TAU / 16.0;
+                points.push(Point3::new(0.2 * a.cos(), 0.2 * a.sin(), z));
+            }
+        }
+        let prim = fit_primitive_to_points(&points);
+        assert!(matches!(prim.kind, PrimitiveKind::Cylinder { .. }));
+        // The cylinder axis is local Z → transform local Z to world
+        let cyl_axis_world = prim.rotation * Vector3::z();
+        // Should be approximately ±world Z
+        assert!(
+            cyl_axis_world.z.abs() > 0.95,
+            "Cylinder along world Z: axis should be ≈(0,0,±1), got {:?}",
+            cyl_axis_world
+        );
+    }
+
+    #[test]
+    fn fit_cylinder_axis_aligned_to_world_x() {
+        // Cylinder along world X → local Z of the fitted frame should ≈ world X
+        let mut points = Vec::new();
+        for k in 0..20 {
+            let x = -2.0 + 4.0 * (k as f64) / 19.0;
+            for i in 0..16 {
+                let a = (i as f64) * std::f64::consts::TAU / 16.0;
+                points.push(Point3::new(x, 0.2 * a.cos(), 0.2 * a.sin()));
+            }
+        }
+        let prim = fit_primitive_to_points(&points);
+        assert!(matches!(prim.kind, PrimitiveKind::Cylinder { .. }));
+        let cyl_axis_world = prim.rotation * Vector3::z();
+        assert!(
+            cyl_axis_world.x.abs() > 0.95,
+            "Cylinder along world X: axis should be ≈(±1,0,0), got {:?}",
+            cyl_axis_world
+        );
+    }
+
+    #[test]
+    fn fit_cylinder_axis_aligned_to_world_y() {
+        // Cylinder along world Y → local Z of the fitted frame should ≈ world Y
+        let mut points = Vec::new();
+        for k in 0..20 {
+            let y = -2.0 + 4.0 * (k as f64) / 19.0;
+            for i in 0..16 {
+                let a = (i as f64) * std::f64::consts::TAU / 16.0;
+                points.push(Point3::new(0.2 * a.cos(), y, 0.2 * a.sin()));
+            }
+        }
+        let prim = fit_primitive_to_points(&points);
+        assert!(matches!(prim.kind, PrimitiveKind::Cylinder { .. }));
+        let cyl_axis_world = prim.rotation * Vector3::z();
+        assert!(
+            cyl_axis_world.y.abs() > 0.95,
+            "Cylinder along world Y: axis should be ≈(0,±1,0), got {:?}",
+            cyl_axis_world
+        );
+    }
+
+    #[test]
     fn primitive_fit_box_mesh() {
         let mesh = make_box(1.0, 1.0, 1.0);
         let prims = mesh.decompose_primitives();
         assert!(!prims.is_empty(), "Should produce at least one primitive");
+    }
+
+    #[test]
+    fn primitive_fit_direct_box_mesh() {
+        let mesh = make_box(1.0, 1.0, 1.0);
+        let prim = mesh.decompose_primitive_direct();
+        assert!(
+            matches!(prim.kind, PrimitiveKind::Box { .. }),
+            "Direct fit on a box mesh should produce Box, got {:?}", prim.kind
+        );
+    }
+
+    #[test]
+    fn primitive_fit_direct_returns_single() {
+        let mesh = make_l_shape();
+        let prim = primitive_fit_direct(&mesh);
+        // Should always return exactly one primitive
+        assert!(
+            matches!(prim.kind, PrimitiveKind::Box { .. } | PrimitiveKind::Cylinder { .. } | PrimitiveKind::Sphere { .. }),
+            "Direct fit should produce a valid primitive, got {:?}", prim.kind
+        );
     }
 
     #[test]
