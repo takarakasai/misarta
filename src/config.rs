@@ -72,6 +72,25 @@ pub struct PoseConfig {
     /// Joint angle / displacement keyed by joint name. Joints not in the map
     /// inherit the model's current value at replay time.
     pub angles: std::collections::BTreeMap<String, f64>,
+    /// Default transition time in seconds when the pose is replayed. Acts as
+    /// the seed value for the per-play UI control; the user can override it
+    /// at playback time without re-saving the pose.
+    #[serde(default = "default_duration")]
+    pub duration: f64,
+    /// Default interpolation curve. Same role as `duration` — a per-pose
+    /// default that can be overridden at playback time.
+    #[serde(default)]
+    pub kind: crate::trajectory::InterpolationKind,
+}
+
+fn default_duration() -> f64 {
+    1.0
+}
+
+impl Default for crate::trajectory::InterpolationKind {
+    fn default() -> Self {
+        crate::trajectory::InterpolationKind::QuinticSmooth
+    }
 }
 
 /// File header.

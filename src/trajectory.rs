@@ -216,7 +216,7 @@ pub fn bspline_cubic<T: RealField>(p0: T, p1: T, p2: T, p3: T, u: T) -> T {
 /// All variants enter and leave at zero velocity (and zero acceleration where
 /// the polynomial supports it), so the robot can latch onto the new target
 /// without a jerk discontinuity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InterpolationKind {
     /// Constant-velocity ramp `p(s) = (1-s)·p0 + s·p1`.
     /// Discontinuous velocity at the endpoints; cheap and predictable.
