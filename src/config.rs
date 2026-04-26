@@ -41,6 +41,7 @@
 //!             pose_6dof: false,
 //!         },
 //!     ],
+//!     pose: vec![],
 //! };
 //! config.save("robot.misarta.toml").unwrap();
 //! ```

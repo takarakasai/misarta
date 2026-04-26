@@ -317,6 +317,158 @@ impl<T: RealField> PoseTransition<T> {
     }
 }
 
+// =============================================================================
+//  Keyframe animation — sequence of joint-space waypoints
+// =============================================================================
+
+/// One waypoint in a [`KeyframeAnimation`].
+///
+/// `time` is the absolute time (s) in the animation timeline at which the
+/// robot should reach `q`. The `kind` controls how the segment **leading up
+/// to** this keyframe is interpolated; the very first keyframe's `kind` is
+/// ignored because there is no preceding segment.
+#[derive(Clone, Debug)]
+pub struct Keyframe<T: RealField> {
+    pub time: T,
+    pub q: Vec<T>,
+    pub kind: InterpolationKind,
+}
+
+impl<T: RealField> Keyframe<T> {
+    pub fn new(time: T, q: Vec<T>, kind: InterpolationKind) -> Self {
+        Self { time, q, kind }
+    }
+}
+
+/// Time-ordered sequence of joint-space keyframes evaluated as a single
+/// continuous animation.
+///
+/// Unlike [`PoseTransition`] (point-to-point), `KeyframeAnimation` strings
+/// many waypoints together so a sim or controller can replay a longer
+/// motion (e.g. crouch → jump → land → recover) with one playback object.
+/// Per-segment interpolation kinds let the choreographer mix linear ramps
+/// (e.g. for foot-up phases) with smooth quintics (for body sway).
+///
+/// # Invariants
+///
+/// - Keyframes are kept sorted by `time` after every mutation.
+/// - The first keyframe's `time` may be any value; `evaluate(t)` clamps to
+///   it so callers don't have to special-case `t < t0`.
+/// - All keyframes are expected to share the same joint vector length;
+///   shorter vectors are padded with the previous frame's values during
+///   evaluation.
+#[derive(Clone, Debug, Default)]
+pub struct KeyframeAnimation<T: RealField> {
+    keyframes: Vec<Keyframe<T>>,
+}
+
+impl<T: RealField> KeyframeAnimation<T> {
+    /// Build from a pre-sorted vector of keyframes. Sorts on insert just in
+    /// case the input wasn't ordered.
+    pub fn new(mut keyframes: Vec<Keyframe<T>>) -> Self {
+        keyframes.sort_by(|a, b| {
+            a.time
+                .partial_cmp(&b.time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Self { keyframes }
+    }
+
+    /// Total number of keyframes.
+    pub fn len(&self) -> usize {
+        self.keyframes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keyframes.is_empty()
+    }
+
+    /// Read-only view of the keyframes.
+    pub fn keyframes(&self) -> &[Keyframe<T>] {
+        &self.keyframes
+    }
+
+    /// Append a keyframe, maintaining time ordering.
+    pub fn push(&mut self, kf: Keyframe<T>) {
+        self.keyframes.push(kf);
+        self.keyframes.sort_by(|a, b| {
+            a.time
+                .partial_cmp(&b.time)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    /// First keyframe's `time` (animation start). Returns 0 if empty.
+    pub fn start_time(&self) -> T {
+        self.keyframes
+            .first()
+            .map(|k| k.time.clone())
+            .unwrap_or_else(T::zero)
+    }
+
+    /// Last keyframe's `time` (animation end). Returns 0 if empty.
+    pub fn end_time(&self) -> T {
+        self.keyframes
+            .last()
+            .map(|k| k.time.clone())
+            .unwrap_or_else(T::zero)
+    }
+
+    /// Total wall-clock duration (`end_time - start_time`).
+    pub fn duration(&self) -> T {
+        self.end_time() - self.start_time()
+    }
+
+    /// `t` is past the last keyframe.
+    pub fn is_done(&self, t: T) -> bool {
+        match self.keyframes.last() {
+            Some(last) => t >= last.time,
+            None => true,
+        }
+    }
+
+    /// Evaluate the joint vector at absolute time `t`.
+    ///
+    /// - `t` before the first keyframe → clamps to that keyframe's `q`.
+    /// - `t` after the last keyframe → clamps to that keyframe's `q`.
+    /// - Otherwise the segment between the bracketing keyframes is
+    ///   interpolated using the *destination* keyframe's [`InterpolationKind`].
+    pub fn evaluate(&self, t: T) -> Vec<T> {
+        if self.keyframes.is_empty() {
+            return Vec::new();
+        }
+        if self.keyframes.len() == 1 {
+            return self.keyframes[0].q.clone();
+        }
+        // Find the segment [k_prev, k_next] bracketing t.
+        if t <= self.keyframes[0].time {
+            return self.keyframes[0].q.clone();
+        }
+        if t >= self.keyframes.last().unwrap().time {
+            return self.keyframes.last().unwrap().q.clone();
+        }
+        // Linear scan is fine — these timelines are short (10s-100s of frames).
+        let mut idx = 0;
+        for i in 1..self.keyframes.len() {
+            if t < self.keyframes[i].time {
+                idx = i;
+                break;
+            }
+        }
+        let prev = &self.keyframes[idx - 1];
+        let next = &self.keyframes[idx];
+        let dur = next.time.clone() - prev.time.clone();
+        let local_t = t - prev.time.clone();
+        let traj = PoseTransition {
+            q_start: prev.q.clone(),
+            q_end: next.q.clone(),
+            duration: dur,
+            kind: next.kind,
+        };
+        traj.evaluate(local_t)
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -413,6 +565,61 @@ mod tests {
         // Should be weighted average closer to middle control points
         assert!(mid > p0);
         assert!(mid < p3);
+    }
+
+    #[test]
+    fn keyframe_anim_clamps_outside_range() {
+        let kfs = vec![
+            Keyframe::new(0.0, vec![0.0, 0.0], InterpolationKind::Linear),
+            Keyframe::new(1.0, vec![1.0, 2.0], InterpolationKind::QuinticSmooth),
+            Keyframe::new(2.0, vec![3.0, -1.0], InterpolationKind::Linear),
+        ];
+        let anim = KeyframeAnimation::new(kfs);
+        // Before start
+        let q = anim.evaluate(-1.0);
+        assert_relative_eq!(q[0], 0.0);
+        assert_relative_eq!(q[1], 0.0);
+        // After end
+        let q = anim.evaluate(10.0);
+        assert_relative_eq!(q[0], 3.0);
+        assert_relative_eq!(q[1], -1.0);
+    }
+
+    #[test]
+    fn keyframe_anim_hits_waypoints_exactly() {
+        let kfs = vec![
+            Keyframe::new(0.0, vec![0.0], InterpolationKind::Linear),
+            Keyframe::new(1.0, vec![5.0], InterpolationKind::QuinticSmooth),
+            Keyframe::new(3.0, vec![-2.0], InterpolationKind::CubicSmooth),
+        ];
+        let anim = KeyframeAnimation::new(kfs);
+        assert_relative_eq!(anim.evaluate(0.0)[0], 0.0, epsilon = 1e-9);
+        assert_relative_eq!(anim.evaluate(1.0)[0], 5.0, epsilon = 1e-9);
+        assert_relative_eq!(anim.evaluate(3.0)[0], -2.0, epsilon = 1e-9);
+        assert!(anim.is_done(3.0));
+        assert!(!anim.is_done(2.999));
+    }
+
+    #[test]
+    fn keyframe_anim_linear_segment_midpoint() {
+        let kfs = vec![
+            Keyframe::new(0.0, vec![0.0], InterpolationKind::Linear),
+            Keyframe::new(2.0, vec![4.0], InterpolationKind::Linear),
+        ];
+        let anim = KeyframeAnimation::new(kfs);
+        // Linear interpolation: t=1.0 → midpoint
+        assert_relative_eq!(anim.evaluate(1.0)[0], 2.0, epsilon = 1e-9);
+        assert_relative_eq!(anim.duration(), 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn keyframe_anim_push_keeps_sorted() {
+        let mut anim: KeyframeAnimation<f64> = KeyframeAnimation::default();
+        anim.push(Keyframe::new(2.0, vec![1.0], InterpolationKind::Linear));
+        anim.push(Keyframe::new(0.0, vec![0.0], InterpolationKind::Linear));
+        anim.push(Keyframe::new(1.0, vec![0.5], InterpolationKind::Linear));
+        let times: Vec<f64> = anim.keyframes().iter().map(|k| k.time).collect();
+        assert_eq!(times, vec![0.0, 1.0, 2.0]);
     }
 
     #[test]
