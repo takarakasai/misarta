@@ -59,6 +59,19 @@ pub struct MisartaConfig {
     /// Loop-closure constraints (may be empty).
     #[serde(default)]
     pub loop_closure: Vec<LoopClosureConfig>,
+    /// Named joint-space poses for replay during simulation (may be empty).
+    #[serde(default)]
+    pub pose: Vec<PoseConfig>,
+}
+
+/// A named joint-space pose stored in the sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoseConfig {
+    /// Human-readable name shown in the UI.
+    pub name: String,
+    /// Joint angle / displacement keyed by joint name. Joints not in the map
+    /// inherit the model's current value at replay time.
+    pub angles: std::collections::BTreeMap<String, f64>,
 }
 
 /// File header.
@@ -96,12 +109,13 @@ impl MisartaConfig {
                 version: CURRENT_VERSION,
             },
             loop_closure: Vec::new(),
+            pose: Vec::new(),
         }
     }
 
     /// Whether the config has any meaningful content worth saving.
     pub fn is_empty(&self) -> bool {
-        self.loop_closure.is_empty()
+        self.loop_closure.is_empty() && self.pose.is_empty()
     }
 
     /// Load from a `.misarta.toml` file.
@@ -187,6 +201,7 @@ mod tests {
                     pose_6dof: true,
                 },
             ],
+            pose: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -241,6 +256,7 @@ version = 999
                 offset_b: [4.0, 5.0, 6.0],
                 pose_6dof: false,
             }],
+            pose: Vec::new(),
         };
         config.save(&tmp).unwrap();
 

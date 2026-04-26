@@ -207,6 +207,116 @@ pub fn bspline_cubic<T: RealField>(p0: T, p1: T, p2: T, p3: T, u: T) -> T {
     n0 * p0 + n1 * p1 + n2 * p2 + n3 * p3
 }
 
+// =============================================================================
+//  Pose-to-pose joint-space transition
+// =============================================================================
+
+/// Choice of interpolation curve for a [`PoseTransition`].
+///
+/// All variants enter and leave at zero velocity (and zero acceleration where
+/// the polynomial supports it), so the robot can latch onto the new target
+/// without a jerk discontinuity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpolationKind {
+    /// Constant-velocity ramp `p(s) = (1-s)·p0 + s·p1`.
+    /// Discontinuous velocity at the endpoints; cheap and predictable.
+    Linear,
+    /// Cubic Hermite with `v(0) = v(1) = 0` — smooth start and stop.
+    CubicSmooth,
+    /// 5-th order polynomial with `v(0) = v(1) = 0` and `a(0) = a(1) = 0` —
+    /// continuous acceleration, matches the typical "S-curve" used in
+    /// industrial motion planners.
+    QuinticSmooth,
+}
+
+impl InterpolationKind {
+    pub const ALL: [InterpolationKind; 3] = [
+        InterpolationKind::Linear,
+        InterpolationKind::CubicSmooth,
+        InterpolationKind::QuinticSmooth,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InterpolationKind::Linear => "Linear",
+            InterpolationKind::CubicSmooth => "Cubic (smooth)",
+            InterpolationKind::QuinticSmooth => "Quintic (smooth)",
+        }
+    }
+}
+
+/// Smooth joint-space transition between two configurations.
+///
+/// `q_start` and `q_end` are full joint vectors (any length, indexed in robot
+/// joint order). [`evaluate`](Self::evaluate) returns the interpolated joint
+/// vector at sim time `t` (clamped to `[0, duration]`). Joints whose start
+/// and end values are equal are passed through unchanged.
+#[derive(Clone, Debug)]
+pub struct PoseTransition<T: RealField> {
+    pub q_start: Vec<T>,
+    pub q_end: Vec<T>,
+    pub duration: T,
+    pub kind: InterpolationKind,
+}
+
+impl<T: RealField> PoseTransition<T> {
+    pub fn new(q_start: Vec<T>, q_end: Vec<T>, duration: T, kind: InterpolationKind) -> Self {
+        Self { q_start, q_end, duration, kind }
+    }
+
+    /// Has `t` reached or exceeded `duration`?
+    pub fn is_done(&self, t: T) -> bool {
+        t >= self.duration
+    }
+
+    /// Per-joint interpolated value at time `t`. Out-of-range `t` is clamped.
+    pub fn evaluate(&self, t: T) -> Vec<T> {
+        let n = self.q_start.len().min(self.q_end.len());
+        let mut out = Vec::with_capacity(n);
+        let zero = T::zero();
+        let dur = self.duration.clone();
+        let t_clamped = if t < zero.clone() {
+            zero.clone()
+        } else if t > dur.clone() {
+            dur.clone()
+        } else {
+            t
+        };
+        // Normalised parameter s ∈ [0, 1]
+        let s = if dur > zero.clone() {
+            t_clamped.clone() / dur.clone()
+        } else {
+            T::one()
+        };
+
+        for i in 0..n {
+            let p0 = self.q_start[i].clone();
+            let p1 = self.q_end[i].clone();
+            let v = match self.kind {
+                InterpolationKind::Linear => linear_interpolate(p0, p1, s.clone()),
+                InterpolationKind::CubicSmooth => cubic_hermite(
+                    p0,
+                    p1,
+                    zero.clone(),
+                    zero.clone(),
+                    s.clone(),
+                    dur.clone(),
+                ),
+                InterpolationKind::QuinticSmooth => quintic_interpolate(
+                    p0,
+                    p1,
+                    zero.clone(),
+                    zero.clone(),
+                    s.clone(),
+                    T::one(),
+                ),
+            };
+            out.push(v);
+        }
+        out
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
