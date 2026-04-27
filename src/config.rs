@@ -42,6 +42,7 @@
 //!         },
 //!     ],
 //!     pose: vec![],
+//!     actuator: vec![],
 //! };
 //! config.save("robot.misarta.toml").unwrap();
 //! ```
@@ -63,6 +64,11 @@ pub struct MisartaConfig {
     /// Named joint-space poses for replay during simulation (may be empty).
     #[serde(default)]
     pub pose: Vec<PoseConfig>,
+    /// Per-joint actuator configuration (mode + gains) used by MJCF export
+    /// and the live MuJoCo controller. Only joints with non-default settings
+    /// need be present; unmatched joints fall back to the host's defaults.
+    #[serde(default)]
+    pub actuator: Vec<ActuatorConfig>,
 }
 
 /// A named joint-space pose stored in the sidecar.
@@ -101,6 +107,48 @@ pub struct MisartaHeader {
     pub version: u32,
 }
 
+/// Control mode for a single actuator. Mirrors the MuJoCo actuator types
+/// articara emits in its MJCF export — `Position` → `<position>`, `Velocity`
+/// → `<velocity>`, `Torque` → `<motor>`. Persisted as a TOML string so the
+/// file stays human-editable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActuatorMode {
+    Position,
+    Velocity,
+    Torque,
+}
+
+impl Default for ActuatorMode {
+    fn default() -> Self {
+        ActuatorMode::Position
+    }
+}
+
+/// Per-joint actuator settings. Stored once per movable joint so the host
+/// can reconstruct identical controller behaviour across sessions / hosts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActuatorConfig {
+    /// Joint name (matches the URDF / SDF joint name).
+    pub joint_name: String,
+    /// Active control mode.
+    #[serde(default)]
+    pub mode: ActuatorMode,
+    /// Position gain (used by `Position`).
+    #[serde(default = "default_actuator_kp")]
+    pub kp: f64,
+    /// Damping / velocity gain (used by `Position` and `Velocity`).
+    #[serde(default = "default_actuator_kv")]
+    pub kv: f64,
+}
+
+fn default_actuator_kp() -> f64 {
+    50.0
+}
+
+fn default_actuator_kv() -> f64 {
+    5.0
+}
+
 /// A single loop-closure constraint definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopClosureConfig {
@@ -130,12 +178,13 @@ impl MisartaConfig {
             },
             loop_closure: Vec::new(),
             pose: Vec::new(),
+            actuator: Vec::new(),
         }
     }
 
     /// Whether the config has any meaningful content worth saving.
     pub fn is_empty(&self) -> bool {
-        self.loop_closure.is_empty() && self.pose.is_empty()
+        self.loop_closure.is_empty() && self.pose.is_empty() && self.actuator.is_empty()
     }
 
     /// Load from a `.misarta.toml` file.
@@ -222,6 +271,7 @@ mod tests {
                 },
             ],
             pose: Vec::new(),
+            actuator: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -264,6 +314,46 @@ version = 999
     }
 
     #[test]
+    fn roundtrip_with_actuators() {
+        let config = MisartaConfig {
+            misarta: MisartaHeader { version: 1 },
+            loop_closure: Vec::new(),
+            pose: Vec::new(),
+            actuator: vec![
+                ActuatorConfig {
+                    joint_name: "hip_l".into(),
+                    mode: ActuatorMode::Position,
+                    kp: 80.0,
+                    kv: 6.5,
+                },
+                ActuatorConfig {
+                    joint_name: "wheel_l".into(),
+                    mode: ActuatorMode::Velocity,
+                    kp: 0.0,
+                    kv: 12.0,
+                },
+            ],
+        };
+        let toml = config.to_toml().unwrap();
+        let parsed = MisartaConfig::from_toml(&toml).unwrap();
+        assert_eq!(parsed.actuator.len(), 2);
+        assert_eq!(parsed.actuator[0].joint_name, "hip_l");
+        assert_eq!(parsed.actuator[0].mode, ActuatorMode::Position);
+        assert!((parsed.actuator[0].kp - 80.0).abs() < 1e-9);
+        assert_eq!(parsed.actuator[1].mode, ActuatorMode::Velocity);
+    }
+
+    #[test]
+    fn parse_minimal_toml_has_empty_actuators() {
+        let text = r#"
+[misarta]
+version = 1
+"#;
+        let config = MisartaConfig::from_toml(text).unwrap();
+        assert!(config.actuator.is_empty());
+    }
+
+    #[test]
     fn save_and_load_file() {
         let tmp = std::env::temp_dir().join("misarta_test_config.misarta.toml");
         let config = MisartaConfig {
@@ -277,6 +367,7 @@ version = 999
                 pose_6dof: false,
             }],
             pose: Vec::new(),
+            actuator: Vec::new(),
         };
         config.save(&tmp).unwrap();
 
