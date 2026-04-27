@@ -83,11 +83,27 @@ pub fn cubic_hermite_derivative<T: RealField>(
 
 /// Quintic polynomial interpolation (5th order, smooth acceleration).
 ///
-/// Ensures zero acceleration at boundaries:
-/// - p(0) = p0, p'(0) = v0, p''(0) = 0
-/// - p(1) = p1, p'(1) = v1, p''(1) = 0
+/// Solves for the unique degree-5 polynomial `p(t)` on `t ∈ [0, dt]`
+/// satisfying the six boundary conditions
 ///
-/// Coefficients from 6 constraints → unique degree-5 polynomial.
+/// ```text
+/// p(0) = p0    p(dt) = p1
+/// p'(0) = v0   p'(dt) = v1
+/// p''(0) = 0   p''(dt) = 0
+/// ```
+///
+/// In closed form, with `τ = t / dt` and `Δp = p1 − p0`:
+///
+/// ```text
+/// p(t) = p0 + v0·t
+///      + ( 10·Δp − 6·v0·dt − 4·v1·dt) · τ³
+///      + (−15·Δp + 8·v0·dt + 7·v1·dt) · τ⁴
+///      + (  6·Δp − 3·v0·dt − 3·v1·dt) · τ⁵
+/// ```
+///
+/// (The earlier implementation had each cubic-and-up coefficient doubled
+/// and a sign flip on the τ⁵ velocity terms, causing a 2× overshoot at
+/// `t = dt` whenever the user requested the QuinticSmooth pose curve.)
 pub fn quintic_interpolate<T: RealField>(
     p0: T,
     p1: T,
@@ -96,36 +112,38 @@ pub fn quintic_interpolate<T: RealField>(
     t: T,
     dt: T,
 ) -> T {
-    let t2 = t.clone() * t.clone();
-    let t3 = t2.clone() * t.clone();
-    let t4 = t3.clone() * t.clone();
-    let t5 = t4.clone() * t.clone();
+    let tau = t.clone() / dt.clone();
+    let tau2 = tau.clone() * tau.clone();
+    let tau3 = tau2.clone() * tau.clone();
+    let tau4 = tau3.clone() * tau.clone();
+    let tau5 = tau4.clone() * tau;
 
-    let dt2 = dt.clone() * dt.clone();
-    let dt3 = dt2.clone() * dt.clone();
+    let p_diff = p1 - p0.clone();
+    let v0dt = v0.clone() * dt.clone();
+    let v1dt = v1 * dt;
 
-    // Quintic basis coefficients for p(t) = c0 + c1*t + c2*t^2 + ... + c5*t^5
-    // satisfying boundary conditions
-    let c0 = p0.clone();
-    let c1 = v0.clone() * dt.clone();
-    let c2 = T::zero(); // a0 = 0
+    let c10 = T::from_f64(10.0).unwrap();
+    let c6 = T::from_f64(6.0).unwrap();
+    let c4f = T::from_f64(4.0).unwrap();
+    let c15 = T::from_f64(15.0).unwrap();
+    let c8 = T::from_f64(8.0).unwrap();
+    let c7 = T::from_f64(7.0).unwrap();
+    let c3f = T::from_f64(3.0).unwrap();
 
-    // From matching p(1) = p1, p'(1) = v1 with a''(1) = 0
-    let p_diff = p1.clone() - p0;
-    let v_sum = v0.clone() + v1.clone();
+    let k3 = c10 * p_diff.clone() - c6.clone() * v0dt.clone() - c4f * v1dt.clone();
+    let k4 = -c15 * p_diff.clone() + c8 * v0dt.clone() + c7 * v1dt.clone();
+    let k5 = c6 * p_diff - c3f.clone() * v0dt - c3f.clone() * v1dt;
+    let _ = c3f;
 
-    let c3 = (T::from_f64(20.0).unwrap() * p_diff.clone() - T::from_f64(8.0).unwrap() * v1.clone() * dt.clone()
-        - T::from_f64(12.0).unwrap() * v0.clone() * dt.clone()) / dt3.clone();
-
-    let c4 = (-T::from_f64(30.0).unwrap() * p_diff.clone() + T::from_f64(14.0).unwrap() * v1.clone() * dt.clone()
-        + T::from_f64(16.0).unwrap() * v0.clone() * dt.clone()) / (dt3.clone() * dt.clone());
-
-    let c5 = (T::from_f64(12.0).unwrap() * p_diff + T::from_f64(6.0).unwrap() * v_sum * dt) / (dt3 * dt2);
-
-    c0 + c1 * t.clone() + c2 * t2.clone() + c3 * t3.clone() + c4 * t4.clone() + c5 * t5
+    p0 + v0 * t + k3 * tau3 + k4 * tau4 + k5 * tau5
 }
 
-/// Derivative (velocity) of quintic polynomial.
+/// Derivative (velocity) of [`quintic_interpolate`].
+///
+/// Differentiating `p(t) = p0 + v0·t + Σᵢ kᵢ·τⁱ` (with `τ = t/dt`) gives
+/// `p'(t) = v0 + Σᵢ (i·kᵢ/dt)·τⁱ⁻¹` for i = 3..=5. We re-derive `k₃, k₄, k₅`
+/// inside this function with the same boundary-condition formulas as
+/// [`quintic_interpolate`] so the two stay in lockstep.
 pub fn quintic_derivative<T: RealField>(
     p0: T,
     p1: T,
@@ -134,32 +152,33 @@ pub fn quintic_derivative<T: RealField>(
     t: T,
     dt: T,
 ) -> T {
-    let t2 = t.clone() * t.clone();
-    let t3 = t2.clone() * t.clone();
-    let t4 = t3.clone() * t.clone();
+    let tau = t / dt.clone();
+    let tau2 = tau.clone() * tau.clone();
+    let tau3 = tau2.clone() * tau.clone();
+    let tau4 = tau3.clone() * tau.clone();
 
-    let dt2 = dt.clone() * dt.clone();
-    let dt3 = dt2.clone() * dt.clone();
+    let p_diff = p1 - p0;
+    let v0dt = v0.clone() * dt.clone();
+    let v1dt = v1 * dt.clone();
 
-    let p_diff = p1.clone() - p0;
-    let v_sum = v0.clone() + v1.clone();
+    let c10 = T::from_f64(10.0).unwrap();
+    let c6 = T::from_f64(6.0).unwrap();
+    let c4f = T::from_f64(4.0).unwrap();
+    let c15 = T::from_f64(15.0).unwrap();
+    let c8 = T::from_f64(8.0).unwrap();
+    let c7 = T::from_f64(7.0).unwrap();
+    let c3f = T::from_f64(3.0).unwrap();
+    let c5f = T::from_f64(5.0).unwrap();
 
-    let c1 = v0.clone();
+    let k3 = c10 * p_diff.clone() - c6.clone() * v0dt.clone() - c4f.clone() * v1dt.clone();
+    let k4 = -c15 * p_diff.clone() + c8 * v0dt.clone() + c7 * v1dt.clone();
+    let k5 = c6 * p_diff - c3f.clone() * v0dt - c3f.clone() * v1dt;
 
-    let c3 = (T::from_f64(20.0).unwrap() * p_diff.clone() - T::from_f64(8.0).unwrap() * v1.clone() * dt2.clone()
-        - T::from_f64(12.0).unwrap() * v0.clone() * dt2.clone()) / dt3.clone();
-
-    let c4_coeff = -T::from_f64(30.0).unwrap() * p_diff.clone() + T::from_f64(14.0).unwrap() * v1.clone() * dt2.clone()
-        + T::from_f64(16.0).unwrap() * v0.clone() * dt2.clone();
-    let c4 = c4_coeff / (dt3.clone() * dt2.clone());
-
-    let c5_coeff = T::from_f64(12.0).unwrap() * p_diff + T::from_f64(6.0).unwrap() * v_sum * dt2.clone();
-    let c5 = c5_coeff / (dt3 * dt2);
-
-    // p'(t) = c1 + 2*c2*t + 3*c3*t^2 + 4*c4*t^3 + 5*c5*t^4
-    c1 + T::from_f64(3.0).unwrap() * c3 * t2.clone() 
-        + T::from_f64(4.0).unwrap() * c4 * t3
-        + T::from_f64(5.0).unwrap() * c5 * t4
+    let inv_dt = T::one() / dt;
+    v0
+        + c3f.clone() * k3 * tau2 * inv_dt.clone()
+        + c4f.clone() * k4 * tau3 * inv_dt.clone()
+        + c5f * k5 * tau4.clone() * inv_dt
 }
 
 /// Linear basis B-spline (piecewise linear).
@@ -542,6 +561,102 @@ mod tests {
 
         let vel0 = quintic_derivative(p0, p1, v0, v1, 0.0, dt);
         assert_relative_eq!(vel0, v0, epsilon = 1e-8);
+    }
+
+    #[test]
+    fn quintic_zero_velocity_reaches_endpoint_no_overshoot() {
+        // Regression for the 2× overshoot bug: at t=dt with v0=v1=0 the
+        // polynomial must land exactly on p1 and never leave [p0, p1].
+        let p0 = 0.0;
+        let p1 = 5.0;
+        let dt = 2.0;
+        let y_end = quintic_interpolate(p0, p1, 0.0, 0.0, dt, dt);
+        assert_relative_eq!(y_end, p1, epsilon = 1e-9);
+        for k in 0..=20 {
+            let t = dt * (k as f64) / 20.0;
+            let y = quintic_interpolate(p0, p1, 0.0, 0.0, t, dt);
+            assert!(
+                y >= p0 - 1e-9 && y <= p1 + 1e-9,
+                "Quintic out of [p0, p1] at t={t}: y={y}"
+            );
+        }
+    }
+
+    #[test]
+    fn quintic_endpoints_with_general_velocity() {
+        let p0 = 0.0;
+        let p1 = 10.0;
+        let v0 = 1.5;
+        let v1 = -0.5;
+        let dt = 2.0;
+        let y_start = quintic_interpolate(p0, p1, v0, v1, 0.0, dt);
+        let y_end = quintic_interpolate(p0, p1, v0, v1, dt, dt);
+        assert_relative_eq!(y_start, p0, epsilon = 1e-9);
+        assert_relative_eq!(y_end, p1, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn quintic_velocity_at_both_endpoints() {
+        let p0 = 0.0;
+        let p1 = 10.0;
+        let v0 = 1.5;
+        let v1 = -0.5;
+        let dt = 2.0;
+        let v_start = quintic_derivative(p0, p1, v0, v1, 0.0, dt);
+        let v_end = quintic_derivative(p0, p1, v0, v1, dt, dt);
+        assert_relative_eq!(v_start, v0, epsilon = 1e-9);
+        assert_relative_eq!(v_end, v1, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn quintic_zero_acceleration_at_endpoints() {
+        // p''(0) = p''(dt) = 0 by construction; verify numerically.
+        let p0: f64 = 0.0;
+        let p1: f64 = 7.0;
+        let v0: f64 = 1.0;
+        let v1: f64 = -2.0;
+        let dt: f64 = 1.5;
+        let h: f64 = 1e-5;
+        let approx_a0 = (quintic_derivative(p0, p1, v0, v1, h, dt)
+            - quintic_derivative(p0, p1, v0, v1, 0.0, dt))
+            / h;
+        let approx_a1 = (quintic_derivative(p0, p1, v0, v1, dt, dt)
+            - quintic_derivative(p0, p1, v0, v1, dt - h, dt))
+            / h;
+        assert!(approx_a0.abs() < 1e-3, "a(0) ≈ 0 expected, got {approx_a0}");
+        assert!(approx_a1.abs() < 1e-3, "a(dt) ≈ 0 expected, got {approx_a1}");
+    }
+
+    #[test]
+    fn pose_transition_quintic_no_overshoot() {
+        // Direct end-to-end test through PoseTransition: this is the path
+        // MuJoCo's pose playback uses, and the bug manifested as the joint
+        // reaching p1 at s=0.5 then continuing to 2·p1 at s=1.
+        let traj = PoseTransition::new(
+            vec![0.0_f64],
+            vec![1.0],
+            1.0,
+            InterpolationKind::QuinticSmooth,
+        );
+        let q_end = traj.evaluate(1.0);
+        assert_relative_eq!(q_end[0], 1.0, epsilon = 1e-9);
+        // Mid-curve sanity: should be between 0 and 1.
+        let q_half = traj.evaluate(0.5);
+        assert!(
+            q_half[0] >= 0.0 && q_half[0] <= 1.0,
+            "Quintic mid-point should be inside [0, 1]: got {}",
+            q_half[0]
+        );
+        // Sweep check.
+        for k in 0..=20 {
+            let s = k as f64 / 20.0;
+            let q = traj.evaluate(s);
+            assert!(
+                q[0] >= -1e-9 && q[0] <= 1.0 + 1e-9,
+                "Quintic out of [0,1] at s={s}: q={}",
+                q[0]
+            );
+        }
     }
 
     #[test]
