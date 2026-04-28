@@ -43,6 +43,7 @@
 //!     ],
 //!     pose: vec![],
 //!     actuator: vec![],
+//!     collision_pair: vec![],
 //! };
 //! config.save("robot.misarta.toml").unwrap();
 //! ```
@@ -69,6 +70,15 @@ pub struct MisartaConfig {
     /// need be present; unmatched joints fall back to the host's defaults.
     #[serde(default)]
     pub actuator: Vec<ActuatorConfig>,
+    /// Per-link-pair collision overrides. Pairs not listed here use the
+    /// host's default behaviour (which is "all link pairs collide" to match
+    /// MuJoCo / SDF defaults). Listed pairs with `enabled = false` are
+    /// emitted as `<contact><exclude>` in MJCF and as filtered pairs for
+    /// USD/Isaac. Pairs with `enabled = true` are no-ops in formats whose
+    /// default is already "collide" — they exist mostly to record the user's
+    /// intent and for round-trip preservation.
+    #[serde(default)]
+    pub collision_pair: Vec<CollisionPairConfig>,
 }
 
 /// A named joint-space pose stored in the sidecar.
@@ -149,6 +159,25 @@ fn default_actuator_kv() -> f64 {
     5.0
 }
 
+/// Per-link-pair collision setting.
+///
+/// Pairs are unordered — `(link_a, link_b)` and `(link_b, link_a)` are
+/// equivalent. The host normalises them to alphabetical order on load /
+/// save so the TOML stays diff-friendly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollisionPairConfig {
+    pub link_a: String,
+    pub link_b: String,
+    /// `true` = collide, `false` = explicitly excluded (e.g. self-collision
+    /// avoidance for adjacent links whose visual meshes overlap).
+    #[serde(default = "default_pair_enabled")]
+    pub enabled: bool,
+}
+
+fn default_pair_enabled() -> bool {
+    true
+}
+
 /// A single loop-closure constraint definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopClosureConfig {
@@ -179,12 +208,16 @@ impl MisartaConfig {
             loop_closure: Vec::new(),
             pose: Vec::new(),
             actuator: Vec::new(),
+            collision_pair: Vec::new(),
         }
     }
 
     /// Whether the config has any meaningful content worth saving.
     pub fn is_empty(&self) -> bool {
-        self.loop_closure.is_empty() && self.pose.is_empty() && self.actuator.is_empty()
+        self.loop_closure.is_empty()
+            && self.pose.is_empty()
+            && self.actuator.is_empty()
+            && self.collision_pair.is_empty()
     }
 
     /// Load from a `.misarta.toml` file.
@@ -272,6 +305,7 @@ mod tests {
             ],
             pose: Vec::new(),
             actuator: Vec::new(),
+            collision_pair: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -333,6 +367,7 @@ version = 999
                     kv: 12.0,
                 },
             ],
+            collision_pair: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -341,6 +376,33 @@ version = 999
         assert_eq!(parsed.actuator[0].mode, ActuatorMode::Position);
         assert!((parsed.actuator[0].kp - 80.0).abs() < 1e-9);
         assert_eq!(parsed.actuator[1].mode, ActuatorMode::Velocity);
+    }
+
+    #[test]
+    fn roundtrip_with_collision_pairs() {
+        let config = MisartaConfig {
+            misarta: MisartaHeader { version: 1 },
+            loop_closure: Vec::new(),
+            pose: Vec::new(),
+            actuator: Vec::new(),
+            collision_pair: vec![
+                CollisionPairConfig {
+                    link_a: "trunk".into(),
+                    link_b: "FL_thigh".into(),
+                    enabled: false,
+                },
+                CollisionPairConfig {
+                    link_a: "FR_calf".into(),
+                    link_b: "FR_foot".into(),
+                    enabled: true,
+                },
+            ],
+        };
+        let toml = config.to_toml().unwrap();
+        let parsed = MisartaConfig::from_toml(&toml).unwrap();
+        assert_eq!(parsed.collision_pair.len(), 2);
+        assert!(!parsed.collision_pair[0].enabled);
+        assert!(parsed.collision_pair[1].enabled);
     }
 
     #[test]
@@ -368,6 +430,7 @@ version = 1
             }],
             pose: Vec::new(),
             actuator: Vec::new(),
+            collision_pair: Vec::new(),
         };
         config.save(&tmp).unwrap();
 
