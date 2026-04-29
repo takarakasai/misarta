@@ -138,14 +138,20 @@ pub struct MisartaHeader {
 }
 
 /// Control mode for a single actuator. Mirrors the MuJoCo actuator types
-/// articara emits in its MJCF export — `Position` → `<position>`, `Velocity`
-/// → `<velocity>`, `Torque` → `<motor>`. Persisted as a TOML string so the
-/// file stays human-editable.
+/// articara emits in its MJCF export plus the computed-torque mode that
+/// only lives in the runtime controller (never serialised into MJCF —
+/// MuJoCo's actuator model can't represent inverse-dynamics feedforward).
+/// Persisted as a TOML string so the file stays human-editable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActuatorMode {
     Position,
     Velocity,
     Torque,
+    /// `τ = M(q)·q̈* + h(q, q̇) + Kp·(q*−q) + Kv·(q̇*−q̇)` (computed-torque).
+    /// Round-trips through the host (articara) only; on MJCF export this
+    /// mode degrades to `<motor>` since the inverse dynamics live outside
+    /// MuJoCo.
+    ComputedTorque,
 }
 
 impl Default for ActuatorMode {
