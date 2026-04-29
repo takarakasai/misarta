@@ -334,6 +334,63 @@ impl<T: RealField> PoseTransition<T> {
         }
         out
     }
+
+    /// Per-joint trajectory velocity `dq/dt` at time `t`. Out-of-range `t`
+    /// returns zero (motion already completed or not yet started). For the
+    /// `Linear` kind we report the constant slope `(q_end - q_start)/duration`
+    /// inside the interval — the discontinuity at the endpoints would otherwise
+    /// appear as a velocity step that no PD controller can track cleanly.
+    ///
+    /// Both `cubic_hermite_derivative` and `quintic_derivative` return derivatives
+    /// in real-time units: `cubic` takes the normalised parameter `s ∈ [0, 1]`
+    /// and the actual `dur` (its closed-form already divides by `dt`), while
+    /// `quintic` takes the **real** time `t` and the same `dur`. Mixing those
+    /// conventions is the only subtle bit; both branches end up with units of
+    /// `q/s` once dur is applied correctly.
+    pub fn evaluate_velocity(&self, t: T) -> Vec<T> {
+        let n = self.q_start.len().min(self.q_end.len());
+        let mut out = Vec::with_capacity(n);
+        let zero = T::zero();
+        let dur = self.duration.clone();
+
+        // Outside the active interval the trajectory is at rest.
+        if dur <= zero.clone() || t < zero.clone() || t > dur.clone() {
+            for _ in 0..n {
+                out.push(T::zero());
+            }
+            return out;
+        }
+
+        let s = t.clone() / dur.clone();
+
+        for i in 0..n {
+            let p0 = self.q_start[i].clone();
+            let p1 = self.q_end[i].clone();
+            let v = match self.kind {
+                InterpolationKind::Linear => {
+                    (p1 - p0) / dur.clone()
+                }
+                InterpolationKind::CubicSmooth => cubic_hermite_derivative(
+                    p0,
+                    p1,
+                    zero.clone(),
+                    zero.clone(),
+                    s.clone(),
+                    dur.clone(),
+                ),
+                InterpolationKind::QuinticSmooth => quintic_derivative(
+                    p0,
+                    p1,
+                    zero.clone(),
+                    zero.clone(),
+                    t.clone(),
+                    dur.clone(),
+                ),
+            };
+            out.push(v);
+        }
+        out
+    }
 }
 
 // =============================================================================
@@ -485,6 +542,52 @@ impl<T: RealField> KeyframeAnimation<T> {
             kind: next.kind,
         };
         traj.evaluate(local_t)
+    }
+
+    /// Per-joint trajectory velocity at time `t`. Returns zeros before the
+    /// first keyframe and after the last (the timeline is at rest there).
+    /// Inside an active segment the velocity comes from the same
+    /// [`PoseTransition`] used for position evaluation, so position and
+    /// velocity stay consistent (their relationship is exactly differentiation).
+    pub fn evaluate_velocity(&self, t: T) -> Vec<T> {
+        let zero_vec = |n: usize| -> Vec<T> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(T::zero());
+            }
+            v
+        };
+        if self.keyframes.is_empty() {
+            return Vec::new();
+        }
+        let n = self.keyframes[0].q.len();
+        if self.keyframes.len() == 1 {
+            return zero_vec(n);
+        }
+        if t <= self.keyframes[0].time {
+            return zero_vec(n);
+        }
+        if t >= self.keyframes.last().unwrap().time {
+            return zero_vec(n);
+        }
+        let mut idx = 0;
+        for i in 1..self.keyframes.len() {
+            if t < self.keyframes[i].time {
+                idx = i;
+                break;
+            }
+        }
+        let prev = &self.keyframes[idx - 1];
+        let next = &self.keyframes[idx];
+        let dur = next.time.clone() - prev.time.clone();
+        let local_t = t - prev.time.clone();
+        let traj = PoseTransition {
+            q_start: prev.q.clone(),
+            q_end: next.q.clone(),
+            duration: dur,
+            kind: next.kind,
+        };
+        traj.evaluate_velocity(local_t)
     }
 }
 
@@ -747,5 +850,112 @@ mod tests {
         // Quadratic B-spline at u=0.5: actual result is 2.25
         // (0.125)(0) + (0.5)(4) + (0.125)(2) = 2.25
         assert_relative_eq!(mid, 2.25, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn pose_transition_velocity_quintic_zero_at_endpoints() {
+        // QuinticSmooth boundary conditions are v(0) = v(dt) = 0.
+        let traj = PoseTransition::new(
+            vec![0.0_f64],
+            vec![1.0],
+            2.0,
+            InterpolationKind::QuinticSmooth,
+        );
+        let v0 = traj.evaluate_velocity(0.0);
+        let v_end = traj.evaluate_velocity(2.0);
+        let v_mid = traj.evaluate_velocity(1.0);
+        assert_relative_eq!(v0[0], 0.0, epsilon = 1e-9);
+        assert_relative_eq!(v_end[0], 0.0, epsilon = 1e-9);
+        // Peak velocity for a 0→1 quintic move over 2 s is 1.875·Δp/dur
+        // = 1.875 · (1 / 2) ≈ 0.9375; just check it's positive and far from 0.
+        assert!(
+            v_mid[0] > 0.5,
+            "Expected non-trivial mid velocity, got {}",
+            v_mid[0],
+        );
+    }
+
+    #[test]
+    fn pose_transition_velocity_linear_constant() {
+        let traj = PoseTransition::new(
+            vec![1.0_f64],
+            vec![5.0],
+            2.0,
+            InterpolationKind::Linear,
+        );
+        // Linear: dq/dt = (5 - 1)/2 = 2 throughout the interior.
+        for s in [0.1, 0.5, 0.99] {
+            let v = traj.evaluate_velocity(s * 2.0);
+            assert_relative_eq!(v[0], 2.0, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn pose_transition_velocity_outside_returns_zero() {
+        let traj = PoseTransition::new(
+            vec![0.0_f64],
+            vec![1.0],
+            1.0,
+            InterpolationKind::QuinticSmooth,
+        );
+        let v_neg = traj.evaluate_velocity(-0.5);
+        let v_post = traj.evaluate_velocity(2.0);
+        assert_relative_eq!(v_neg[0], 0.0);
+        assert_relative_eq!(v_post[0], 0.0);
+    }
+
+    #[test]
+    fn pose_transition_velocity_matches_finite_difference() {
+        // The closed-form derivative must agree with a centred finite
+        // difference of evaluate(); if these two ever drift apart we have a
+        // bug in either the polynomial or its derivative.
+        let traj = PoseTransition::new(
+            vec![0.0_f64, -1.0],
+            vec![3.0, 2.0],
+            1.5,
+            InterpolationKind::QuinticSmooth,
+        );
+        let h = 1e-5;
+        for &t in &[0.05_f64, 0.4, 0.75, 1.1, 1.45] {
+            let v_closed = traj.evaluate_velocity(t);
+            let q_plus = traj.evaluate(t + h);
+            let q_minus = traj.evaluate(t - h);
+            for i in 0..2 {
+                let v_fd = (q_plus[i] - q_minus[i]) / (2.0 * h);
+                assert_relative_eq!(v_closed[i], v_fd, epsilon = 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn keyframe_anim_velocity_zero_outside_range() {
+        let kfs = vec![
+            Keyframe::new(0.0, vec![0.0_f64], InterpolationKind::Linear),
+            Keyframe::new(1.0, vec![1.0], InterpolationKind::QuinticSmooth),
+        ];
+        let anim = KeyframeAnimation::new(kfs);
+        assert_relative_eq!(anim.evaluate_velocity(-0.1)[0], 0.0);
+        assert_relative_eq!(anim.evaluate_velocity(1.5)[0], 0.0);
+    }
+
+    #[test]
+    fn keyframe_anim_velocity_within_segment() {
+        // Two-segment animation: linear then quintic. Verify each segment's
+        // interior velocity matches its standalone PoseTransition reading.
+        let kfs = vec![
+            Keyframe::new(0.0, vec![0.0_f64], InterpolationKind::Linear),
+            Keyframe::new(1.0, vec![2.0], InterpolationKind::Linear),
+            Keyframe::new(3.0, vec![-1.0], InterpolationKind::QuinticSmooth),
+        ];
+        let anim = KeyframeAnimation::new(kfs);
+        // First segment (linear, 0→2 over 1 s) → constant 2.0.
+        assert_relative_eq!(
+            anim.evaluate_velocity(0.5)[0],
+            2.0,
+            epsilon = 1e-9,
+        );
+        // Mid of second segment (quintic, 2→-1 over 2 s) → finite, negative.
+        let v = anim.evaluate_velocity(2.0)[0];
+        assert!(v < -0.1, "Expected negative mid velocity, got {v}");
     }
 }

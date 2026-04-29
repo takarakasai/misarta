@@ -169,6 +169,13 @@ pub struct ActuatorConfig {
     /// Damping / velocity gain (used by `Position` and `Velocity`).
     #[serde(default = "default_actuator_kv")]
     pub kv: f64,
+    /// Reflected rotor inertia (kg·m² for revolute, kg for prismatic). Maps to
+    /// MuJoCo's `<joint armature="…"/>`.
+    #[serde(default)]
+    pub armature: f64,
+    /// Passive joint damping coefficient. Maps to MuJoCo's `<joint damping="…"/>`.
+    #[serde(default)]
+    pub joint_damping: f64,
 }
 
 fn default_actuator_kp() -> f64 {
@@ -588,12 +595,16 @@ version = 999
                     mode: ActuatorMode::Position,
                     kp: 80.0,
                     kv: 6.5,
+                    armature: 0.012,
+                    joint_damping: 0.4,
                 },
                 ActuatorConfig {
                     joint_name: "wheel_l".into(),
                     mode: ActuatorMode::Velocity,
                     kp: 0.0,
                     kv: 12.0,
+                    armature: 0.0,
+                    joint_damping: 0.0,
                 },
             ],
             collision_pair: Vec::new(),
@@ -607,7 +618,10 @@ version = 999
         assert_eq!(parsed.actuator[0].joint_name, "hip_l");
         assert_eq!(parsed.actuator[0].mode, ActuatorMode::Position);
         assert!((parsed.actuator[0].kp - 80.0).abs() < 1e-9);
+        assert!((parsed.actuator[0].armature - 0.012).abs() < 1e-9);
+        assert!((parsed.actuator[0].joint_damping - 0.4).abs() < 1e-9);
         assert_eq!(parsed.actuator[1].mode, ActuatorMode::Velocity);
+        assert!((parsed.actuator[1].armature).abs() < 1e-9);
     }
 
     #[test]
