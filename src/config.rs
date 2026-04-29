@@ -99,6 +99,11 @@ pub struct MisartaConfig {
     /// formats (SDF/MJCF/USD) translate during export.
     #[serde(default)]
     pub sensor: Vec<SensorConfig>,
+    /// Quadruped gait presets. Multiple entries allow saving variants
+    /// (e.g. `slow_walk`, `fast_trot`); the host app typically loads the
+    /// first as the default but can switch by name.
+    #[serde(default)]
+    pub gait: Vec<GaitConfigEntry>,
 }
 
 /// A named joint-space pose stored in the sidecar.
@@ -441,6 +446,7 @@ impl MisartaConfig {
             sequence: Vec::new(),
             mimic: Vec::new(),
             sensor: Vec::new(),
+            gait: Vec::new(),
         }
     }
 
@@ -503,6 +509,99 @@ impl Default for MisartaConfig {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  Quadruped gait — sidecar persistence schema
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Gait family. Mirrors `quadruped_gait::GaitType` but lives in the
+/// misarta config crate so the persistence layer doesn't pull in the
+/// gait library. Stored as a TOML string so the file stays human-readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GaitTypeConfig {
+    Trot,
+    Walk,
+    Pace,
+    Bound,
+}
+
+impl Default for GaitTypeConfig {
+    fn default() -> Self {
+        GaitTypeConfig::Trot
+    }
+}
+
+/// One quadruped gait preset stored in the sidecar.
+///
+/// Holds the **user-tunable** subset of `quadruped_gait::GaitController`
+/// state — things the host app can't reconstruct just by looking at the
+/// URDF. The leg link lengths / hip offsets are intentionally NOT stored:
+/// they're auto-detected from the model on every load via
+/// `articara::gait::auto_detect_kinematics_config`. Saving them would let
+/// the user's model edit drift out of sync with the cached kinematics
+/// silently. Only override the auto-detection by overriding
+/// `nominal_foot_body_*` fields explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GaitConfigEntry {
+    /// Preset name shown in the UI dropdown.
+    pub name: String,
+    #[serde(default)]
+    pub gait_type: GaitTypeConfig,
+    /// One full leg cycle (s).
+    #[serde(default = "default_cycle_period")]
+    pub cycle_period_s: f64,
+    /// Fraction of cycle each foot is in stance.
+    #[serde(default = "default_duty_factor")]
+    pub duty_factor: f64,
+    /// Peak swing height above the stance plane (m).
+    #[serde(default = "default_swing_height")]
+    pub swing_height_m: f64,
+    /// Footstep planner clamp (m).
+    #[serde(default = "default_max_step")]
+    pub max_step_length_m: f64,
+    /// Foot link names per leg in canonical FL/FR/RL/RR order. The host
+    /// uses these to re-run kinematics auto-detection on load.
+    #[serde(default = "default_fl_foot")]
+    pub fl_foot: String,
+    #[serde(default = "default_fr_foot")]
+    pub fr_foot: String,
+    #[serde(default = "default_rl_foot")]
+    pub rl_foot: String,
+    #[serde(default = "default_rr_foot")]
+    pub rr_foot: String,
+    /// Per-leg knee direction. `[FL, FR, RL, RR]`. `true` = bends forward
+    /// (front-leg style), `false` = bends backward. Default all-false
+    /// matches the analytical IK's natural sign convention.
+    #[serde(default)]
+    pub knee_forward: [bool; 4],
+}
+
+fn default_cycle_period() -> f64 { 0.4 }
+fn default_duty_factor() -> f64 { 0.5 }
+fn default_swing_height() -> f64 { 0.04 }
+fn default_max_step() -> f64 { 0.10 }
+fn default_fl_foot() -> String { "FL_foot".into() }
+fn default_fr_foot() -> String { "FR_foot".into() }
+fn default_rl_foot() -> String { "RL_foot".into() }
+fn default_rr_foot() -> String { "RR_foot".into() }
+
+impl Default for GaitConfigEntry {
+    fn default() -> Self {
+        Self {
+            name: "default".into(),
+            gait_type: GaitTypeConfig::default(),
+            cycle_period_s: default_cycle_period(),
+            duty_factor: default_duty_factor(),
+            swing_height_m: default_swing_height(),
+            max_step_length_m: default_max_step(),
+            fl_foot: default_fl_foot(),
+            fr_foot: default_fr_foot(),
+            rl_foot: default_rl_foot(),
+            rr_foot: default_rr_foot(),
+            knee_forward: [false; 4],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +647,7 @@ mod tests {
             sequence: Vec::new(),
             mimic: Vec::new(),
             sensor: Vec::new(),
+            gait: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -617,6 +717,7 @@ version = 999
             sequence: Vec::new(),
             mimic: Vec::new(),
             sensor: Vec::new(),
+            gait: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -652,6 +753,7 @@ version = 999
             sequence: Vec::new(),
             mimic: Vec::new(),
             sensor: Vec::new(),
+            gait: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -685,6 +787,7 @@ version = 999
             }],
             mimic: Vec::new(),
             sensor: Vec::new(),
+            gait: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -711,6 +814,7 @@ version = 999
                 offset: 0.0,
             }],
             sensor: Vec::new(),
+            gait: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -771,6 +875,7 @@ version = 999
                     },
                 },
             ],
+            gait: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -787,6 +892,32 @@ version = 999
             SensorKind::Lidar { h_samples, .. } => assert_eq!(*h_samples, 1024),
             _ => panic!("expected Lidar"),
         }
+    }
+
+    #[test]
+    fn roundtrip_with_gait() {
+        let mut cfg = MisartaConfig::new();
+        cfg.gait.push(GaitConfigEntry {
+            name: "fast_trot".into(),
+            gait_type: GaitTypeConfig::Trot,
+            cycle_period_s: 0.30,
+            duty_factor: 0.45,
+            swing_height_m: 0.05,
+            max_step_length_m: 0.12,
+            fl_foot: "FL_paw".into(),
+            fr_foot: "FR_paw".into(),
+            rl_foot: "RL_paw".into(),
+            rr_foot: "RR_paw".into(),
+            knee_forward: [true, true, false, false],
+        });
+        let toml = cfg.to_toml().unwrap();
+        let parsed = MisartaConfig::from_toml(&toml).unwrap();
+        assert_eq!(parsed.gait.len(), 1);
+        let g = &parsed.gait[0];
+        assert_eq!(g.name, "fast_trot");
+        assert!((g.cycle_period_s - 0.30).abs() < 1e-9);
+        assert_eq!(g.fl_foot, "FL_paw");
+        assert_eq!(g.knee_forward, [true, true, false, false]);
     }
 
     #[test]
@@ -820,6 +951,7 @@ version = 1
             sequence: Vec::new(),
             mimic: Vec::new(),
             sensor: Vec::new(),
+            gait: Vec::new(),
         };
         config.save(&tmp).unwrap();
 
