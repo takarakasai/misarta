@@ -47,6 +47,8 @@
 //!     actuator: vec![],
 //!     collision_pair: vec![],
 //!     sequence: vec![],
+//!     mimic: vec![],
+//!     sensor: vec![],
 //! };
 //! config.save("robot.misarta.toml").unwrap();
 //! ```
@@ -88,6 +90,15 @@ pub struct MisartaConfig {
     /// state for the first step).
     #[serde(default)]
     pub sequence: Vec<SequenceConfig>,
+    /// Coupled (mimic) joints — `joint = multiplier · source_joint + offset`.
+    /// Linear coupling matches the URDF / SDF native form; MJCF can express
+    /// the same shape via `<equality><joint polycoef="off mult 0 0 0">`.
+    #[serde(default)]
+    pub mimic: Vec<MimicConfig>,
+    /// Sensors mounted on links. Format-agnostic representation; per-target
+    /// formats (SDF/MJCF/USD) translate during export.
+    #[serde(default)]
+    pub sensor: Vec<SensorConfig>,
 }
 
 /// A named joint-space pose stored in the sidecar.
@@ -187,6 +198,146 @@ fn default_pair_enabled() -> bool {
     true
 }
 
+/// A linear coupling between two joints — `joint = multiplier · source + offset`.
+///
+/// Modelled after URDF's `<mimic>` (the most-common form). The host can
+/// translate to MJCF's `<equality><joint polycoef="off mult 0 0 0">` /
+/// SDF's `<axis><mimic>`. USD has no native mimic concept; importers may
+/// drop or warn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MimicConfig {
+    /// Joint that follows.
+    pub joint: String,
+    /// Joint that drives.
+    pub source: String,
+    #[serde(default = "default_one")]
+    pub multiplier: f64,
+    #[serde(default)]
+    pub offset: f64,
+}
+
+fn default_one() -> f64 {
+    1.0
+}
+
+/// A sensor mounted on a link, in a format-neutral representation. Each
+/// kind carries the parameters most exporters need; format-specific
+/// extras can be tunnelled through the optional `params` map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorConfig {
+    /// User-visible name (used as the geom / sensor name in exports).
+    pub name: String,
+    /// Link the sensor is rigidly attached to.
+    pub link: String,
+    /// Local-frame translation `[x, y, z]`.
+    #[serde(default)]
+    pub origin: [f64; 3],
+    /// Local-frame quaternion rotation `[x, y, z, w]`.
+    #[serde(default = "default_quat", skip_serializing_if = "is_identity_quat")]
+    pub orientation: [f64; 4],
+    /// Sample rate in Hz. `0.0` means "let the simulator pick a default".
+    #[serde(default)]
+    pub update_rate: f64,
+    /// Type-specific parameters.
+    #[serde(flatten)]
+    pub kind: SensorKind,
+}
+
+/// Sensor type discriminator. `#[serde(tag = "type")]` makes the TOML
+/// representation use a `type = "..."` field per entry, which round-trips
+/// through `SensorConfig.kind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SensorKind {
+    /// Pinhole / depth camera. Renders an image stream in target sims.
+    Camera {
+        #[serde(default = "default_fov")]
+        fov: f64,
+        #[serde(default = "default_width")]
+        width: u32,
+        #[serde(default = "default_height")]
+        height: u32,
+        #[serde(default = "default_near")]
+        near: f64,
+        #[serde(default = "default_far")]
+        far: f64,
+    },
+    /// Ray-cast (LiDAR) sensor — 1D or 2D scan with horizontal/vertical FOVs.
+    Lidar {
+        #[serde(default = "default_lidar_range_min")]
+        range_min: f64,
+        #[serde(default = "default_lidar_range_max")]
+        range_max: f64,
+        /// Horizontal FOV in radians.
+        #[serde(default = "default_lidar_h_fov")]
+        h_fov: f64,
+        #[serde(default = "default_lidar_h_samples")]
+        h_samples: u32,
+        /// Vertical FOV in radians (0 = single-line scan).
+        #[serde(default)]
+        v_fov: f64,
+        #[serde(default = "default_lidar_v_samples")]
+        v_samples: u32,
+    },
+    /// Accelerometer + gyroscope.
+    Imu {
+        #[serde(default)]
+        gyro_noise: f64,
+        #[serde(default)]
+        accel_noise: f64,
+    },
+    /// 6-axis force/torque mounted on a joint or link.
+    ForceTorque {
+        /// Optional joint to measure (defaults to the parent joint of `link`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        joint: Option<String>,
+    },
+    /// Boolean / scalar contact sensor on a link.
+    Contact {
+        /// Optional partner link to filter against. None = any contact.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partner: Option<String>,
+    },
+    /// Escape hatch for sensor types we don't yet model. Round-trips raw
+    /// key/value strings so importer/exporter round-trips don't lose data.
+    Generic {
+        kind: String,
+        #[serde(default)]
+        params: std::collections::BTreeMap<String, String>,
+    },
+}
+
+fn default_fov() -> f64 {
+    std::f64::consts::FRAC_PI_3
+}
+fn default_width() -> u32 {
+    640
+}
+fn default_height() -> u32 {
+    480
+}
+fn default_near() -> f64 {
+    0.05
+}
+fn default_far() -> f64 {
+    100.0
+}
+fn default_lidar_range_min() -> f64 {
+    0.05
+}
+fn default_lidar_range_max() -> f64 {
+    30.0
+}
+fn default_lidar_h_fov() -> f64 {
+    std::f64::consts::TAU
+}
+fn default_lidar_h_samples() -> u32 {
+    360
+}
+fn default_lidar_v_samples() -> u32 {
+    1
+}
+
 /// A chained-pose sequence (e.g. crouch → extend → land).
 ///
 /// Stored as a list of steps, each referencing a [`PoseConfig`] by name and
@@ -275,6 +426,8 @@ impl MisartaConfig {
             actuator: Vec::new(),
             collision_pair: Vec::new(),
             sequence: Vec::new(),
+            mimic: Vec::new(),
+            sensor: Vec::new(),
         }
     }
 
@@ -285,6 +438,8 @@ impl MisartaConfig {
             && self.actuator.is_empty()
             && self.collision_pair.is_empty()
             && self.sequence.is_empty()
+            && self.mimic.is_empty()
+            && self.sensor.is_empty()
     }
 
     /// Load from a `.misarta.toml` file.
@@ -378,6 +533,8 @@ mod tests {
             actuator: Vec::new(),
             collision_pair: Vec::new(),
             sequence: Vec::new(),
+            mimic: Vec::new(),
+            sensor: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -441,6 +598,8 @@ version = 999
             ],
             collision_pair: Vec::new(),
             sequence: Vec::new(),
+            mimic: Vec::new(),
+            sensor: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -471,6 +630,8 @@ version = 999
                 },
             ],
             sequence: Vec::new(),
+            mimic: Vec::new(),
+            sensor: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -502,6 +663,8 @@ version = 999
                     },
                 ],
             }],
+            mimic: Vec::new(),
+            sensor: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -510,6 +673,100 @@ version = 999
         assert_eq!(parsed.sequence[0].steps.len(), 2);
         assert_eq!(parsed.sequence[0].steps[0].pose_name, "crouch");
         assert!((parsed.sequence[0].steps[1].duration - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn roundtrip_with_mimic() {
+        let config = MisartaConfig {
+            misarta: MisartaHeader { version: 1 },
+            loop_closure: Vec::new(),
+            pose: Vec::new(),
+            actuator: Vec::new(),
+            collision_pair: Vec::new(),
+            sequence: Vec::new(),
+            mimic: vec![MimicConfig {
+                joint: "wheel_r".into(),
+                source: "wheel_l".into(),
+                multiplier: -1.0,
+                offset: 0.0,
+            }],
+            sensor: Vec::new(),
+        };
+        let toml = config.to_toml().unwrap();
+        let parsed = MisartaConfig::from_toml(&toml).unwrap();
+        assert_eq!(parsed.mimic.len(), 1);
+        assert_eq!(parsed.mimic[0].source, "wheel_l");
+        assert!((parsed.mimic[0].multiplier - (-1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn roundtrip_with_sensors() {
+        let config = MisartaConfig {
+            misarta: MisartaHeader { version: 1 },
+            loop_closure: Vec::new(),
+            pose: Vec::new(),
+            actuator: Vec::new(),
+            collision_pair: Vec::new(),
+            sequence: Vec::new(),
+            mimic: Vec::new(),
+            sensor: vec![
+                SensorConfig {
+                    name: "front_camera".into(),
+                    link: "head".into(),
+                    origin: [0.1, 0.0, 0.05],
+                    orientation: default_quat(),
+                    update_rate: 30.0,
+                    kind: SensorKind::Camera {
+                        fov: 1.0,
+                        width: 320,
+                        height: 240,
+                        near: 0.05,
+                        far: 50.0,
+                    },
+                },
+                SensorConfig {
+                    name: "lidar".into(),
+                    link: "lidar_mount".into(),
+                    origin: [0.0, 0.0, 0.1],
+                    orientation: default_quat(),
+                    update_rate: 10.0,
+                    kind: SensorKind::Lidar {
+                        range_min: 0.05,
+                        range_max: 30.0,
+                        h_fov: std::f64::consts::TAU,
+                        h_samples: 1024,
+                        v_fov: 0.5,
+                        v_samples: 16,
+                    },
+                },
+                SensorConfig {
+                    name: "imu".into(),
+                    link: "trunk".into(),
+                    origin: [0.0, 0.0, 0.0],
+                    orientation: default_quat(),
+                    update_rate: 200.0,
+                    kind: SensorKind::Imu {
+                        gyro_noise: 0.001,
+                        accel_noise: 0.01,
+                    },
+                },
+            ],
+        };
+        let toml = config.to_toml().unwrap();
+        let parsed = MisartaConfig::from_toml(&toml).unwrap();
+        assert_eq!(parsed.sensor.len(), 3);
+        assert_eq!(parsed.sensor[0].name, "front_camera");
+        match &parsed.sensor[0].kind {
+            SensorKind::Camera { width, height, .. } => {
+                assert_eq!(*width, 320);
+                assert_eq!(*height, 240);
+            }
+            _ => panic!("expected Camera"),
+        }
+        match &parsed.sensor[1].kind {
+            SensorKind::Lidar { h_samples, .. } => assert_eq!(*h_samples, 1024),
+            _ => panic!("expected Lidar"),
+        }
     }
 
     #[test]
@@ -541,6 +798,8 @@ version = 1
             actuator: Vec::new(),
             collision_pair: Vec::new(),
             sequence: Vec::new(),
+            mimic: Vec::new(),
+            sensor: Vec::new(),
         };
         config.save(&tmp).unwrap();
 
