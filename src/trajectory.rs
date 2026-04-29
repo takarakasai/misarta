@@ -81,6 +81,36 @@ pub fn cubic_hermite_derivative<T: RealField>(
     (dh00 * p0 + dh10 * v0 + dh01 * p1 + dh11 * v1) * dt_inv
 }
 
+/// Second derivative (acceleration) of cubic Hermite interpolation.
+///
+/// `t` is the normalised parameter `s ∈ [0, 1]`; `dt` is the segment duration
+/// (real-time seconds). The h00/h01 basis terms (acting on `p0`, `p1`) need
+/// `1/dt²` because they were originally a function of `s = t/dt`. The
+/// h10/h11 terms (acting on `v0·dt`, `v1·dt`) need only `1/dt` because the
+/// extra `dt` factor cancels one of them out.
+pub fn cubic_hermite_second_derivative<T: RealField>(
+    p0: T,
+    p1: T,
+    v0: T,
+    v1: T,
+    t: T,
+    dt: T,
+) -> T {
+    let twelve = T::from_f64(12.0).unwrap();
+    let six = T::from_f64(6.0).unwrap();
+    let four = T::from_f64(4.0).unwrap();
+    let two = T::from_f64(2.0).unwrap();
+
+    let ddh00 = twelve.clone() * t.clone() - six.clone();
+    let ddh10 = six.clone() * t.clone() - four;
+    let ddh01 = -twelve * t.clone() + six.clone();
+    let ddh11 = six * t - two;
+
+    let dt_inv = T::one() / dt.clone();
+    let dt_inv2 = dt_inv.clone() * dt_inv.clone();
+    (ddh00 * p0 + ddh01 * p1) * dt_inv2 + (ddh10 * v0 + ddh11 * v1) * dt_inv
+}
+
 /// Quintic polynomial interpolation (5th order, smooth acceleration).
 ///
 /// Solves for the unique degree-5 polynomial `p(t)` on `t ∈ [0, dt]`
@@ -179,6 +209,51 @@ pub fn quintic_derivative<T: RealField>(
         + c3f.clone() * k3 * tau2 * inv_dt.clone()
         + c4f.clone() * k4 * tau3 * inv_dt.clone()
         + c5f * k5 * tau4.clone() * inv_dt
+}
+
+/// Second derivative (acceleration) of [`quintic_interpolate`].
+///
+/// Differentiating `p'(t) = v0 + Σᵢ (i·kᵢ/dt)·τⁱ⁻¹` once more (with respect
+/// to real time, noting `dτ/dt = 1/dt`) gives
+/// `p''(t) = Σᵢ i·(i-1)·kᵢ/dt²·τⁱ⁻²` for i = 3..=5. The k₃ / k₄ / k₅
+/// formulas are re-derived inside this function so they stay locked with
+/// [`quintic_interpolate`] and [`quintic_derivative`].
+pub fn quintic_second_derivative<T: RealField>(
+    p0: T,
+    p1: T,
+    v0: T,
+    v1: T,
+    t: T,
+    dt: T,
+) -> T {
+    let tau = t / dt.clone();
+    let tau2 = tau.clone() * tau.clone();
+    let tau3 = tau2.clone() * tau.clone();
+
+    let p_diff = p1 - p0;
+    let v0dt = v0.clone() * dt.clone();
+    let v1dt = v1 * dt.clone();
+
+    let c10 = T::from_f64(10.0).unwrap();
+    let c6 = T::from_f64(6.0).unwrap();
+    let c4f = T::from_f64(4.0).unwrap();
+    let c15 = T::from_f64(15.0).unwrap();
+    let c8 = T::from_f64(8.0).unwrap();
+    let c7 = T::from_f64(7.0).unwrap();
+    let c3f = T::from_f64(3.0).unwrap();
+    let c12 = T::from_f64(12.0).unwrap();
+    let c20 = T::from_f64(20.0).unwrap();
+
+    let k3 = c10 * p_diff.clone() - c6.clone() * v0dt.clone() - c4f * v1dt.clone();
+    let k4 = -c15 * p_diff.clone() + c8 * v0dt.clone() + c7 * v1dt.clone();
+    let k5 = c6 * p_diff - c3f.clone() * v0dt - c3f * v1dt;
+
+    let inv_dt = T::one() / dt;
+    let inv_dt2 = inv_dt.clone() * inv_dt;
+
+    // p''(t) = (6 k3) τ / dt² + (12 k4) τ² / dt² + (20 k5) τ³ / dt²
+    let c6b = T::from_f64(6.0).unwrap();
+    (c6b * k3 * tau + c12 * k4 * tau2 + c20 * k5 * tau3) * inv_dt2
 }
 
 /// Linear basis B-spline (piecewise linear).
@@ -328,6 +403,58 @@ impl<T: RealField> PoseTransition<T> {
                     zero.clone(),
                     s.clone(),
                     T::one(),
+                ),
+            };
+            out.push(v);
+        }
+        out
+    }
+
+    /// Per-joint trajectory acceleration `d²q/dt²` at time `t`. Linear segments
+    /// have zero interior acceleration (they're a straight line) and we return
+    /// zero outside the active interval too; the smooth kinds use their
+    /// closed-form second derivatives.
+    ///
+    /// The host's computed-torque controller multiplies `q̈*` by the inertia
+    /// matrix `M(q)` to get the motor torque needed to actually realise the
+    /// commanded motion. Without acceleration feedforward, the PD has to
+    /// derive that torque from position error alone, which means the motion
+    /// always lags the trajectory and overshoots when leaving saturation.
+    pub fn evaluate_acceleration(&self, t: T) -> Vec<T> {
+        let n = self.q_start.len().min(self.q_end.len());
+        let mut out = Vec::with_capacity(n);
+        let zero = T::zero();
+        let dur = self.duration.clone();
+
+        if dur <= zero.clone() || t < zero.clone() || t > dur.clone() {
+            for _ in 0..n {
+                out.push(T::zero());
+            }
+            return out;
+        }
+
+        let s = t.clone() / dur.clone();
+
+        for i in 0..n {
+            let p0 = self.q_start[i].clone();
+            let p1 = self.q_end[i].clone();
+            let v = match self.kind {
+                InterpolationKind::Linear => T::zero(),
+                InterpolationKind::CubicSmooth => cubic_hermite_second_derivative(
+                    p0,
+                    p1,
+                    zero.clone(),
+                    zero.clone(),
+                    s.clone(),
+                    dur.clone(),
+                ),
+                InterpolationKind::QuinticSmooth => quintic_second_derivative(
+                    p0,
+                    p1,
+                    zero.clone(),
+                    zero.clone(),
+                    t.clone(),
+                    dur.clone(),
                 ),
             };
             out.push(v);
@@ -588,6 +715,53 @@ impl<T: RealField> KeyframeAnimation<T> {
             kind: next.kind,
         };
         traj.evaluate_velocity(local_t)
+    }
+
+    /// Per-joint trajectory acceleration at time `t`. Mirrors
+    /// [`Self::evaluate_velocity`]: returns zeros outside the timeline and
+    /// inside Linear segments, otherwise delegates to the matching
+    /// [`PoseTransition`]. The result is in the same units as `q̈` (typically
+    /// rad/s² for revolute and m/s² for prismatic joints) and is suitable
+    /// for direct use as the feedforward `q̈*` term in computed-torque control.
+    pub fn evaluate_acceleration(&self, t: T) -> Vec<T> {
+        let zero_vec = |n: usize| -> Vec<T> {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(T::zero());
+            }
+            v
+        };
+        if self.keyframes.is_empty() {
+            return Vec::new();
+        }
+        let n = self.keyframes[0].q.len();
+        if self.keyframes.len() == 1 {
+            return zero_vec(n);
+        }
+        if t <= self.keyframes[0].time {
+            return zero_vec(n);
+        }
+        if t >= self.keyframes.last().unwrap().time {
+            return zero_vec(n);
+        }
+        let mut idx = 0;
+        for i in 1..self.keyframes.len() {
+            if t < self.keyframes[i].time {
+                idx = i;
+                break;
+            }
+        }
+        let prev = &self.keyframes[idx - 1];
+        let next = &self.keyframes[idx];
+        let dur = next.time.clone() - prev.time.clone();
+        let local_t = t - prev.time.clone();
+        let traj = PoseTransition {
+            q_start: prev.q.clone(),
+            q_end: next.q.clone(),
+            duration: dur,
+            kind: next.kind,
+        };
+        traj.evaluate_acceleration(local_t)
     }
 }
 
@@ -936,6 +1110,120 @@ mod tests {
         let anim = KeyframeAnimation::new(kfs);
         assert_relative_eq!(anim.evaluate_velocity(-0.1)[0], 0.0);
         assert_relative_eq!(anim.evaluate_velocity(1.5)[0], 0.0);
+    }
+
+    #[test]
+    fn pose_transition_acceleration_quintic_endpoints_zero() {
+        // Quintic boundary conditions explicitly demand p''(0) = p''(dt) = 0.
+        let traj = PoseTransition::new(
+            vec![0.0_f64],
+            vec![1.0],
+            2.0,
+            InterpolationKind::QuinticSmooth,
+        );
+        let a0 = traj.evaluate_acceleration(0.0);
+        let a_end = traj.evaluate_acceleration(2.0);
+        assert!(
+            a0[0].abs() < 1e-9,
+            "Quintic accel at t=0 should be 0, got {}",
+            a0[0]
+        );
+        assert!(
+            a_end[0].abs() < 1e-9,
+            "Quintic accel at t=dur should be 0, got {}",
+            a_end[0]
+        );
+    }
+
+    #[test]
+    fn pose_transition_acceleration_linear_zero_interior() {
+        // Linear is a straight line: zero acceleration throughout the interior.
+        let traj = PoseTransition::new(
+            vec![1.0_f64],
+            vec![5.0],
+            2.0,
+            InterpolationKind::Linear,
+        );
+        for s in [0.1, 0.5, 0.99] {
+            let a = traj.evaluate_acceleration(s * 2.0);
+            assert!(
+                a[0].abs() < 1e-12,
+                "Linear accel must be 0 in interior, got {} at s={}",
+                a[0],
+                s,
+            );
+        }
+    }
+
+    #[test]
+    fn pose_transition_acceleration_matches_finite_difference() {
+        // Closed-form q̈ must agree with a centred finite difference of
+        // evaluate_velocity.  Sweep through both Cubic and Quintic segments.
+        for kind in [InterpolationKind::CubicSmooth, InterpolationKind::QuinticSmooth] {
+            let traj = PoseTransition::new(
+                vec![0.0_f64, -1.0],
+                vec![3.0, 2.0],
+                1.5,
+                kind,
+            );
+            let h = 1e-5;
+            for &t in &[0.05_f64, 0.4, 0.75, 1.1, 1.45] {
+                let a_closed = traj.evaluate_acceleration(t);
+                let v_plus = traj.evaluate_velocity(t + h);
+                let v_minus = traj.evaluate_velocity(t - h);
+                for i in 0..2 {
+                    let a_fd = (v_plus[i] - v_minus[i]) / (2.0 * h);
+                    assert_relative_eq!(a_closed[i], a_fd, epsilon = 1e-2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyframe_anim_acceleration_within_segment() {
+        // The keyframe's `kind` controls the segment LEADING UP TO that
+        // keyframe (the first keyframe's kind is ignored — it has no
+        // predecessor). So for a quintic segment from t=0 to t=1, the
+        // SECOND keyframe must be QuinticSmooth.
+        //
+        // Quintic acceleration at s=0.5 is zero (inflection point) and at
+        // the segment endpoints is zero (boundary conditions). Sample at
+        // s=0.25 to confirm the closed-form is producing non-trivial values
+        // in the interior.
+        let kfs = vec![
+            Keyframe::new(0.0, vec![0.0_f64], InterpolationKind::Linear),
+            Keyframe::new(1.0, vec![2.0], InterpolationKind::QuinticSmooth),
+            Keyframe::new(2.0, vec![1.0], InterpolationKind::Linear),
+        ];
+        let anim = KeyframeAnimation::new(kfs);
+        // Linear segment 1→2 (straight line) → zero accel throughout.
+        let a_linear_interior = anim.evaluate_acceleration(1.5);
+        assert!(a_linear_interior[0].abs() < 1e-12);
+        // Quintic at s=0.25 inside the segment t∈[0,1] → t = 0.25
+        let a_quintic_quarter = anim.evaluate_acceleration(0.25);
+        assert!(
+            a_quintic_quarter[0].abs() > 0.5,
+            "Quintic segment at s=0.25 should have non-trivial accel, got {}",
+            a_quintic_quarter[0],
+        );
+        // Inflection point at s=0.5 → t=0.5
+        let a_quintic_mid = anim.evaluate_acceleration(0.5);
+        assert!(
+            a_quintic_mid[0].abs() < 1e-9,
+            "Quintic accel must vanish at the inflection, got {}",
+            a_quintic_mid[0],
+        );
+    }
+
+    #[test]
+    fn keyframe_anim_acceleration_outside_range_zero() {
+        let kfs = vec![
+            Keyframe::new(0.0, vec![0.0_f64], InterpolationKind::QuinticSmooth),
+            Keyframe::new(1.0, vec![1.0], InterpolationKind::QuinticSmooth),
+        ];
+        let anim = KeyframeAnimation::new(kfs);
+        assert_relative_eq!(anim.evaluate_acceleration(-0.1)[0], 0.0);
+        assert_relative_eq!(anim.evaluate_acceleration(1.5)[0], 0.0);
     }
 
     #[test]
