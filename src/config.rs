@@ -38,12 +38,15 @@
 //!             offset_a: [0.3, 0.0, 0.0],
 //!             link_b: "crank_right".into(),
 //!             offset_b: [0.0, 0.0, 0.2],
+//!             rot_a: [0.0, 0.0, 0.0, 1.0],
+//!             rot_b: [0.0, 0.0, 0.0, 1.0],
 //!             pose_6dof: false,
 //!         },
 //!     ],
 //!     pose: vec![],
 //!     actuator: vec![],
 //!     collision_pair: vec![],
+//!     sequence: vec![],
 //! };
 //! config.save("robot.misarta.toml").unwrap();
 //! ```
@@ -79,6 +82,12 @@ pub struct MisartaConfig {
     /// intent and for round-trip preservation.
     #[serde(default)]
     pub collision_pair: Vec<CollisionPairConfig>,
+    /// Named pose sequences for chained replay (e.g. crouch → extend → land).
+    /// Each step references a pose by name and specifies the transition
+    /// duration / curve from the *previous* step (or the model's current
+    /// state for the first step).
+    #[serde(default)]
+    pub sequence: Vec<SequenceConfig>,
 }
 
 /// A named joint-space pose stored in the sidecar.
@@ -178,24 +187,80 @@ fn default_pair_enabled() -> bool {
     true
 }
 
+/// A chained-pose sequence (e.g. crouch → extend → land).
+///
+/// Stored as a list of steps, each referencing a [`PoseConfig`] by name and
+/// declaring how long to transition into it from the previous step's pose
+/// (or the current model state for the first step). Replayed via the host
+/// `play_sequence` script API or the Sequences UI section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceConfig {
+    pub name: String,
+    pub steps: Vec<SequenceStepConfig>,
+}
+
+/// One step in a [`SequenceConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceStepConfig {
+    /// Name of a registered pose to transition INTO.
+    pub pose_name: String,
+    /// Time in seconds spent reaching `pose_name` from the previous step's
+    /// pose (or the current model state for the first step).
+    #[serde(default = "default_step_duration")]
+    pub duration: f64,
+    /// Interpolation curve for this step.
+    #[serde(default)]
+    pub kind: crate::trajectory::InterpolationKind,
+}
+
+fn default_step_duration() -> f64 {
+    1.0
+}
+
 /// A single loop-closure constraint definition.
+///
+/// Stored offsets are local-frame transforms on each link. The constraint
+/// solver enforces `link_a · offset_a == link_b · offset_b` (position only
+/// when `pose_6dof = false`, full pose otherwise). Rotation fields default
+/// to identity and are silently dropped during serialisation when they
+/// equal identity, keeping the TOML diff-friendly for the common
+/// position-only case.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopClosureConfig {
     /// Human-readable name.
     pub name: String,
     /// First link name.
     pub link_a: String,
-    /// Offset in link_a's local frame `[x, y, z]`.
+    /// Translation offset in link_a's local frame `[x, y, z]`.
     #[serde(default)]
     pub offset_a: [f64; 3],
+    /// Rotation offset in link_a's local frame as quaternion `[x, y, z, w]`.
+    /// Identity (`[0, 0, 0, 1]`) when omitted.
+    #[serde(default = "default_quat", skip_serializing_if = "is_identity_quat")]
+    pub rot_a: [f64; 4],
     /// Second link name.
     pub link_b: String,
-    /// Offset in link_b's local frame `[x, y, z]`.
+    /// Translation offset in link_b's local frame `[x, y, z]`.
     #[serde(default)]
     pub offset_b: [f64; 3],
+    /// Rotation offset in link_b's local frame as quaternion `[x, y, z, w]`.
+    /// Identity (`[0, 0, 0, 1]`) when omitted.
+    #[serde(default = "default_quat", skip_serializing_if = "is_identity_quat")]
+    pub rot_b: [f64; 4],
     /// Whether to constrain full pose (6-DoF) or position only (3-DoF).
     #[serde(default)]
     pub pose_6dof: bool,
+}
+
+fn default_quat() -> [f64; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+
+fn is_identity_quat(q: &[f64; 4]) -> bool {
+    (q[0].abs() < 1e-12)
+        && (q[1].abs() < 1e-12)
+        && (q[2].abs() < 1e-12)
+        && ((q[3] - 1.0).abs() < 1e-12 || (q[3] + 1.0).abs() < 1e-12)
 }
 
 impl MisartaConfig {
@@ -209,6 +274,7 @@ impl MisartaConfig {
             pose: Vec::new(),
             actuator: Vec::new(),
             collision_pair: Vec::new(),
+            sequence: Vec::new(),
         }
     }
 
@@ -218,6 +284,7 @@ impl MisartaConfig {
             && self.pose.is_empty()
             && self.actuator.is_empty()
             && self.collision_pair.is_empty()
+            && self.sequence.is_empty()
     }
 
     /// Load from a `.misarta.toml` file.
@@ -290,22 +357,27 @@ mod tests {
                     name: "four_bar".into(),
                     link_a: "coupler".into(),
                     offset_a: [0.3, 0.0, 0.0],
+                    rot_a: default_quat(),
                     link_b: "crank_right".into(),
                     offset_b: [0.0, 0.0, 0.2],
+                    rot_b: default_quat(),
                     pose_6dof: false,
                 },
                 LoopClosureConfig {
                     name: "weld".into(),
                     link_a: "hand_l".into(),
                     offset_a: [0.0, 0.0, 0.1],
+                    rot_a: default_quat(),
                     link_b: "hand_r".into(),
                     offset_b: [0.0, 0.0, 0.1],
+                    rot_b: default_quat(),
                     pose_6dof: true,
                 },
             ],
             pose: Vec::new(),
             actuator: Vec::new(),
             collision_pair: Vec::new(),
+            sequence: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -368,6 +440,7 @@ version = 999
                 },
             ],
             collision_pair: Vec::new(),
+            sequence: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -397,12 +470,46 @@ version = 999
                     enabled: true,
                 },
             ],
+            sequence: Vec::new(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
         assert_eq!(parsed.collision_pair.len(), 2);
         assert!(!parsed.collision_pair[0].enabled);
         assert!(parsed.collision_pair[1].enabled);
+    }
+
+    #[test]
+    fn roundtrip_with_sequences() {
+        let config = MisartaConfig {
+            misarta: MisartaHeader { version: 1 },
+            loop_closure: Vec::new(),
+            pose: Vec::new(),
+            actuator: Vec::new(),
+            collision_pair: Vec::new(),
+            sequence: vec![SequenceConfig {
+                name: "jump".into(),
+                steps: vec![
+                    SequenceStepConfig {
+                        pose_name: "crouch".into(),
+                        duration: 0.5,
+                        kind: crate::trajectory::InterpolationKind::QuinticSmooth,
+                    },
+                    SequenceStepConfig {
+                        pose_name: "extended".into(),
+                        duration: 0.1,
+                        kind: crate::trajectory::InterpolationKind::Linear,
+                    },
+                ],
+            }],
+        };
+        let toml = config.to_toml().unwrap();
+        let parsed = MisartaConfig::from_toml(&toml).unwrap();
+        assert_eq!(parsed.sequence.len(), 1);
+        assert_eq!(parsed.sequence[0].name, "jump");
+        assert_eq!(parsed.sequence[0].steps.len(), 2);
+        assert_eq!(parsed.sequence[0].steps[0].pose_name, "crouch");
+        assert!((parsed.sequence[0].steps[1].duration - 0.1).abs() < 1e-9);
     }
 
     #[test]
@@ -424,13 +531,16 @@ version = 1
                 name: "test".into(),
                 link_a: "a".into(),
                 offset_a: [1.0, 2.0, 3.0],
+                rot_a: default_quat(),
                 link_b: "b".into(),
                 offset_b: [4.0, 5.0, 6.0],
+                rot_b: default_quat(),
                 pose_6dof: false,
             }],
             pose: Vec::new(),
             actuator: Vec::new(),
             collision_pair: Vec::new(),
+            sequence: Vec::new(),
         };
         config.save(&tmp).unwrap();
 
