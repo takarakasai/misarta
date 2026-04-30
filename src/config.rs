@@ -104,6 +104,12 @@ pub struct MisartaConfig {
     /// first as the default but can switch by name.
     #[serde(default)]
     pub gait: Vec<GaitConfigEntry>,
+    /// Home pose — initial joint configuration + floating-base transform
+    /// applied at load time. Lets a session round-trip the user's last
+    /// saved pose without an explicit `[[pose]]` entry. Defaults to
+    /// "no information" (URDF defaults remain in effect).
+    #[serde(default)]
+    pub home: HomeConfig,
 }
 
 /// A named joint-space pose stored in the sidecar.
@@ -447,6 +453,7 @@ impl MisartaConfig {
             mimic: Vec::new(),
             sensor: Vec::new(),
             gait: Vec::new(),
+            home: HomeConfig::default(),
         }
     }
 
@@ -506,6 +513,65 @@ impl MisartaConfig {
 impl Default for MisartaConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  Home pose — joint angles + floating-base transform persisted across
+//  sessions, so the model opens up exactly where the user left it.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Initial pose applied right after a sidecar load. All fields default
+/// to "no information": empty joint map, origin translation, identity
+/// quaternion. The host treats those defaults as no-ops, so a freshly
+/// imported URDF / SDF / MJCF / USD with no `[home]` section keeps its
+/// own neutral configuration.
+///
+/// Why this is separate from `[[pose]]`: poses are *named user-saved
+/// targets* used for replay (sequences, jumps); home is *the resume
+/// state* — the model's current configuration when the user last hit
+/// Save. Both can coexist; home is automatic, poses are deliberate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeConfig {
+    /// Joint angles keyed by joint name. Joints not in the map keep
+    /// their URDF / SDF default at load time, so partial home entries
+    /// don't blow away unrelated state.
+    #[serde(default)]
+    pub joint_positions: std::collections::BTreeMap<String, f64>,
+    /// Floating-base translation in world frame (m).
+    #[serde(default = "default_zero3")]
+    pub base_position: [f64; 3],
+    /// Floating-base orientation as a quaternion `[qx, qy, qz, qw]`.
+    /// Defaults to identity `[0, 0, 0, 1]`.
+    #[serde(default = "default_identity_quat")]
+    pub base_orientation: [f64; 4],
+}
+
+fn default_zero3() -> [f64; 3] {
+    [0.0, 0.0, 0.0]
+}
+fn default_identity_quat() -> [f64; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+
+impl Default for HomeConfig {
+    fn default() -> Self {
+        Self {
+            joint_positions: std::collections::BTreeMap::new(),
+            base_position: default_zero3(),
+            base_orientation: default_identity_quat(),
+        }
+    }
+}
+
+impl HomeConfig {
+    /// True when every field is at its default. The host can use this to
+    /// decide whether a `.misarta.toml` round-trip carries any home
+    /// information at all (skip writing `[home]` if not).
+    pub fn is_empty(&self) -> bool {
+        self.joint_positions.is_empty()
+            && self.base_position == default_zero3()
+            && self.base_orientation == default_identity_quat()
     }
 }
 
@@ -648,6 +714,7 @@ mod tests {
             mimic: Vec::new(),
             sensor: Vec::new(),
             gait: Vec::new(),
+            home: HomeConfig::default(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -718,6 +785,7 @@ version = 999
             mimic: Vec::new(),
             sensor: Vec::new(),
             gait: Vec::new(),
+            home: HomeConfig::default(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -754,6 +822,7 @@ version = 999
             mimic: Vec::new(),
             sensor: Vec::new(),
             gait: Vec::new(),
+            home: HomeConfig::default(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -788,6 +857,7 @@ version = 999
             mimic: Vec::new(),
             sensor: Vec::new(),
             gait: Vec::new(),
+            home: HomeConfig::default(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -815,6 +885,7 @@ version = 999
             }],
             sensor: Vec::new(),
             gait: Vec::new(),
+            home: HomeConfig::default(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -876,6 +947,7 @@ version = 999
                 },
             ],
             gait: Vec::new(),
+            home: HomeConfig::default(),
         };
         let toml = config.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();
@@ -952,6 +1024,7 @@ version = 1
             mimic: Vec::new(),
             sensor: Vec::new(),
             gait: Vec::new(),
+            home: HomeConfig::default(),
         };
         config.save(&tmp).unwrap();
 
