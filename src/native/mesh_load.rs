@@ -52,6 +52,12 @@ impl MeshLoadReport {
 /// log a warning into [`MeshLoadReport::failed`] for now and remain
 /// available as a follow-up.
 ///
+/// Mesh references are passed through [`normalise_mesh_reference`] before
+/// being handed to `assets`, so URDF-style `package://name/sub/foo.stl`
+/// and `file://abs/path` references work alongside `.misa`'s
+/// already-relative paths. Absolute paths are still rejected by the
+/// `AssetSource` sandbox.
+///
 /// Returns [`Err(NativeError::Asset(_))`] only for *unexpected* asset
 /// errors (permission denied, IO error). `NotFound` is non-fatal and
 /// surfaces via `report.missing` so a single missing mesh doesn't kill
@@ -69,14 +75,15 @@ pub fn load_meshes(
             continue;
         }
         // Only mesh shapes have something to load.
-        let path = match &obj.shape {
+        let raw_path = match &obj.shape {
             GeometryShape::Mesh { filename, .. } => filename.clone(),
             _ => continue,
         };
-        if path.is_empty() {
+        if raw_path.is_empty() {
             // Procedural / placeholder mesh with no source — nothing to do.
             continue;
         }
+        let path = normalise_mesh_reference(&raw_path);
 
         match assets.read(&path) {
             Ok(bytes) => match parse_mesh_bytes(&path, &bytes) {
@@ -85,17 +92,43 @@ pub fn load_meshes(
                     report.loaded += 1;
                 }
                 Err(e) => {
-                    report.failed.push((path, e));
+                    // Record under the *original* path so users can find
+                    // the source reference in their input file.
+                    report.failed.push((raw_path, e));
                 }
             },
             Err(AssetError::NotFound) => {
-                report.missing.push(path);
+                report.missing.push(raw_path);
             }
             Err(other) => return Err(NativeError::Asset(other)),
         }
     }
 
     Ok(report)
+}
+
+/// Normalise a mesh reference into an [`AssetSource`]-compatible logical
+/// path. Strips URI prefixes commonly produced by URDF / SDF importers:
+///
+/// - `package://<pkg>/sub/foo.stl` → `sub/foo.stl`
+/// - `file:///absolute/path.stl` → unchanged (caller's `AssetSource`
+///   sandbox will reject the absolute form, which is the right outcome)
+/// - already-relative paths are returned untouched
+///
+/// Public so URDF / SDF consumers can pre-normalise references before
+/// other passes (validation, asset-existence checks, etc.).
+pub fn normalise_mesh_reference(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("package://") {
+        // Drop the package name (everything up to the first `/`).
+        if let Some(slash) = rest.find('/') {
+            return rest[slash + 1..].to_string();
+        }
+        return rest.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("file://") {
+        return rest.to_string();
+    }
+    s.to_string()
 }
 
 /// Load both visual and collision meshes in a single call.
@@ -283,6 +316,35 @@ mod tests {
         let report = load_meshes(&mut geom, &InMemorySource::new()).unwrap();
         assert_eq!(report.loaded, 0);
         assert!(report.missing.is_empty());
+    }
+
+    #[test]
+    fn normalise_mesh_reference_strips_package_uri() {
+        assert_eq!(
+            normalise_mesh_reference("package://my_robot/meshes/trunk.stl"),
+            "meshes/trunk.stl"
+        );
+        assert_eq!(normalise_mesh_reference("package://only_pkg"), "only_pkg");
+        assert_eq!(normalise_mesh_reference("file:///abs/path.stl"), "/abs/path.stl");
+        assert_eq!(normalise_mesh_reference("meshes/foo.stl"), "meshes/foo.stl");
+        assert_eq!(normalise_mesh_reference("foo.stl"), "foo.stl");
+    }
+
+    #[test]
+    fn load_meshes_handles_urdf_package_uri() {
+        // Simulate a URDF-style mesh reference: the GeometryObject was
+        // populated by misarta::urdf::load_urdf_geometry which leaves
+        // package:// intact. load_meshes should normalise it before
+        // calling AssetSource.
+        let mut src = InMemorySource::new();
+        src.insert("meshes/cube.stl", one_triangle_stl_bytes());
+        let mut geom = GeometryModel::new();
+        geom.add(mesh_object("u", "package://my_robot/meshes/cube.stl"));
+
+        let report = load_meshes(&mut geom, &src).unwrap();
+        assert_eq!(report.loaded, 1);
+        assert!(report.is_clean());
+        assert!(geom.objects[0].mesh_data.is_some());
     }
 
     #[test]

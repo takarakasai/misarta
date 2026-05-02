@@ -1,6 +1,26 @@
-//! SDF (Simulation Description Format) loader.
+//! SDF (Simulation Description Format) loader — standalone misarta layer.
 //!
-//! Parses an SDF XML string (version 1.5–1.8) and builds a `Model<f64>`.
+//! Parses an SDF XML string (version 1.5–1.8) and builds a `Model<f64>`
+//! plus optional `GeometryModel`s. Targeted at downstream consumers of
+//! misarta who don't depend on articara — e.g. headless analysis tools,
+//! research code, or alternative front-ends.
+//!
+//! # Layering vs `articara::sdf`
+//!
+//! There are intentionally two SDF parsers in this workspace:
+//!
+//! | Crate | Output | Adds |
+//! |---|---|---|
+//! | `misarta::sdf` (this module) | `Model<f64>` + `GeometryModel × 2` | — (kinematics + plain geometry only) |
+//! | `articara::sdf` | `articara::RobotModel` | sensors, mimic, articara-side material handling, `.misarta.toml` sidecar integration, named pose state |
+//!
+//! articara does NOT delegate to this loader — the two parse paths
+//! evolve in parallel. This is acceptable because misarta-side is a
+//! strict subset (kinematics + plain geometry); upstream-side bug fixes
+//! that touch only structural parsing should be applied to both.
+//! Full deduplication is tracked in `articara/doc/refactor_20260502.md`
+//! §9.1 as a future refactor (cost: significant; risk: regression in
+//! either consumer).
 //!
 //! # Supported elements
 //!

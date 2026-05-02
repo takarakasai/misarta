@@ -51,7 +51,7 @@ pub mod source;
 pub mod write;
 
 pub use build::build_model;
-pub use mesh_load::{load_meshes, load_meshes_into, MeshLoadReport};
+pub use mesh_load::{load_meshes, load_meshes_into, normalise_mesh_reference, MeshLoadReport};
 pub use parse::parse_str;
 pub use report::{is_valid_identifier, sanitize_identifier, LoadReport,
                  MaterialCollision, NameSanitization};

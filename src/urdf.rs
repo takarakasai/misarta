@@ -17,6 +17,28 @@
 //! let xml = std::fs::read_to_string("robot.urdf").unwrap();
 //! let model = urdf::load_urdf_string(&xml).unwrap();
 //! ```
+//!
+//! # Loading meshes via [`AssetSource`](crate::native::AssetSource)
+//!
+//! [`load_urdf_geometry_string`] populates each `GeometryObject` with
+//! its `mesh_path` (verbatim from the URDF, often
+//! `package://<pkg>/sub/foo.stl`) and leaves `mesh_data` empty.
+//! [`crate::native::load_meshes`] handles those references through any
+//! [`AssetSource`](crate::native::AssetSource) — `package://` and
+//! `file://` prefixes are stripped automatically by
+//! [`crate::native::normalise_mesh_reference`].
+//!
+//! ```no_run
+//! use misarta::{urdf, native};
+//! let xml = std::fs::read_to_string("robot.urdf").unwrap();
+//! let (model, mut visual, mut collision) =
+//!     urdf::load_urdf_geometry_string(&xml).unwrap();
+//!
+//! // Resolve mesh files relative to the URDF's package root.
+//! let assets = native::FileSystemSource::new("path/to/package_root");
+//! let _vrep = native::load_meshes(&mut visual, &assets).unwrap();
+//! let _crep = native::load_meshes(&mut collision, &assets).unwrap();
+//! ```
 
 use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
 use crate::joint::JointType;
