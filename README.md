@@ -256,6 +256,34 @@ let ddq = aba::aba(&model, &q, &v, &tau);
 
 ---
 
+## Python Bindings
+
+Python から misarta を利用するための binding が
+[`articara/misarta-py/`](../misarta-py/) に用意されています (PyO3 + maturin)。
+MVP では FK / Jacobian / RNEA / CRBA / ABA / URDF ローダ / SE3 操作を公開。
+
+```python
+import numpy as np
+import misarta
+
+model = misarta.load_urdf("path/to/robot.urdf")
+q = np.zeros(model.nq)
+
+data = misarta.forward_kinematics(model, q)
+T = data.oMi(1)                                       # SE3 (joint 1, world frame)
+
+J   = misarta.compute_joint_jacobian(model, q, 1)     # 6 x nv
+M   = misarta.crba(model, q)                          # 質量行列
+tau = misarta.rnea(model, q, np.zeros(model.nv), np.zeros(model.nv))
+ddq = misarta.aba(model, q, np.zeros(model.nv), tau)
+```
+
+- 設計計画: [`doc/python-binding-plan.md`](doc/python-binding-plan.md)
+- 実装レポート: [`doc/python-binding-implementation.md`](doc/python-binding-implementation.md)
+- ビルド手順: [`../misarta-py/README.md`](../misarta-py/README.md)
+
+---
+
 ## License
 
 Copyright 2026 Takara Kasai
