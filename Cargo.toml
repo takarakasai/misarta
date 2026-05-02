@@ -2,7 +2,7 @@
 name = "misarta"
 version = "0.1.0"
 edition = "2024"
-description = "Rigid body kinematics and dynamics for articulated robots"
+description = "Rust rigid-body dynamics library based on Featherstone's spatial algebra. Provides O(n) kinematics, dynamics, and optimization akin to Pinocchio, with generic RealField support."
 license = "Apache-2.0"
 authors = ["Takara Kasai <takara.kasai@gmail.com>"]
 
