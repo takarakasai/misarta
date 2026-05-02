@@ -34,3 +34,4 @@ pub mod coriolis;
 pub mod config;
 pub mod decimate;
 pub mod decompose;
+pub mod native;
