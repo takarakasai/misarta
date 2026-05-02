@@ -142,6 +142,19 @@ impl MeshData {
         Self::from_indexed_mesh(&stl)
     }
 
+    /// Parse mesh data from an in-memory STL byte buffer (binary or ASCII).
+    ///
+    /// Same parser as [`MeshData::from_stl`] but works without `std::fs` —
+    /// useful for callers that obtain bytes via an asset abstraction
+    /// (e.g. [`crate::native::AssetSource`]) or have the data
+    /// embedded in a binary via `include_bytes!`.
+    pub fn from_stl_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let stl = stl_io::read_stl(&mut cursor)
+            .map_err(|e| format!("STL parse error: {e}"))?;
+        Self::from_indexed_mesh(&stl)
+    }
+
     /// Build `MeshData` from an `stl_io::IndexedMesh`.
     pub fn from_indexed_mesh(mesh: &stl_io::IndexedMesh) -> Result<Self, String> {
         let vertices: Vec<Point3<f64>> = mesh

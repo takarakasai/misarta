@@ -43,6 +43,7 @@
 //! ```
 
 pub mod build;
+pub mod mesh_load;
 pub mod parse;
 pub mod report;
 pub mod schema;
@@ -50,6 +51,7 @@ pub mod source;
 pub mod write;
 
 pub use build::build_model;
+pub use mesh_load::{load_meshes, load_meshes_into, MeshLoadReport};
 pub use parse::parse_str;
 pub use report::{is_valid_identifier, sanitize_identifier, LoadReport,
                  MaterialCollision, NameSanitization};
