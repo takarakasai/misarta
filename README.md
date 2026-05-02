@@ -256,6 +256,9 @@ let ddq = aba::aba(&model, &q, &v, &tau);
 
 ---
 
-## ライセンス
+## License
 
-articara プロジェクトのライセンスに準じます。
+Copyright 2026 Takara Kasai
+
+Licensed under the Apache License, Version 2.0 — see [../LICENSE](../LICENSE)
+or <http://www.apache.org/licenses/LICENSE-2.0>.
