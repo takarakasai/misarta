@@ -101,6 +101,24 @@ pub struct QpConfig {
     pub feasibility_tol: f64,
     /// Tolerance for step-norm and multiplier optimality checks.
     pub optimality_tol: f64,
+    /// Proximal warm-start weight. When > 0 **and** an `x0` is passed
+    /// to [`solve_qp`], the cost is augmented with
+    /// `(prox_weight / 2) · ‖x − x0‖²`. The augmentation biases the
+    /// optimum toward `x0`, which is the cheapest way to dampen
+    /// tick-to-tick jitter when the same QP is solved repeatedly with
+    /// slightly perturbed data and a wide null space (typical of WBC).
+    ///
+    /// Backend handling:
+    /// - **ActiveSet**: in addition to the prox cost, `x0` is still
+    ///   used as the initial feasible point (existing behaviour).
+    /// - **Clarabel**: the IPM has no public warm-start hook in
+    ///   clarabel 0.11, but the prox augmentation reshapes the
+    ///   problem so the new optimum is close to `x0` (operator-
+    ///   splitting-style warm-start at the cost level).
+    ///
+    /// 0.0 disables the prox term (default — preserves the original
+    /// solver behaviour for callers that don't need warm-start).
+    pub prox_weight: f64,
 }
 
 impl Default for QpConfig {
@@ -110,6 +128,7 @@ impl Default for QpConfig {
             max_iters: 500,
             feasibility_tol: 1e-10,
             optimality_tol: 1e-8,
+            prox_weight: 0.0,
         }
     }
 }
@@ -138,14 +157,44 @@ pub fn solve_qp(
     x0: Option<&DVector<f64>>,
     config: &QpConfig,
 ) -> QpSolution {
-    match config.solver {
+    // Apply proximal warm-start: when prox_weight > 0 AND x0 is given,
+    // augment the cost with (ρ/2)·‖x − x0‖² = (ρ/2)·xᵀx − ρ·x0ᵀx + const.
+    // → H' = H + ρ·I,  c' = c − ρ·x0
+    // The augmented problem has the same constraints and a unique-r
+    // optimum close to x0 (controlled by ρ). The const term shifts the
+    // objective value but doesn't affect the argmin or the multipliers.
+    let (h_owned, c_owned) = if config.prox_weight > 0.0 {
+        if let Some(x0v) = x0 {
+            let n = h.nrows();
+            assert_eq!(
+                x0v.nrows(),
+                n,
+                "solve_qp: x0 length must match H dimension when prox_weight > 0"
+            );
+            let mut h_aug = h.clone();
+            let mut c_aug = c.clone();
+            for i in 0..n {
+                h_aug[(i, i)] += config.prox_weight;
+                c_aug[i] -= config.prox_weight * x0v[i];
+            }
+            (Some(h_aug), Some(c_aug))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+    let h_eff: &DMatrix<f64> = h_owned.as_ref().unwrap_or(h);
+    let c_eff: &DVector<f64> = c_owned.as_ref().unwrap_or(c);
+
+    let mut sol = match config.solver {
         QpSolver::ActiveSet => {
-            solve_qp_active_set(h, c, a_eq, b_eq, a_iq, b_iq, x0, config)
+            solve_qp_active_set(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, x0, config)
         }
         QpSolver::Clarabel => {
             #[cfg(feature = "clarabel")]
             {
-                solve_qp_clarabel(h, c, a_eq, b_eq, a_iq, b_iq, config)
+                solve_qp_clarabel(h_eff, c_eff, a_eq, b_eq, a_iq, b_iq, config)
             }
             #[cfg(not(feature = "clarabel"))]
             {
@@ -155,7 +204,16 @@ pub fn solve_qp(
                 );
             }
         }
+    };
+
+    // If we ran on an augmented (h_eff, c_eff), report `objective` for the
+    // **original** problem — callers expect ½ xᵀHx + cᵀx, not the prox-
+    // augmented value. Multipliers are unchanged because the prox term
+    // is an unconstrained quadratic addition (gradient at x* matches).
+    if h_owned.is_some() {
+        sol.objective = 0.5 * sol.x.dot(&(h * &sol.x)) + c.dot(&sol.x);
     }
+    sol
 }
 
 // ─── Active-set backend ─────────────────────────────────────────────────────
@@ -1117,6 +1175,91 @@ mod tests {
         let b_iq = DVector::from_vec(b_data);
         let x0 = DVector::from_element(n, 1.0); // feasible start: sum=5
         cross_validate(&h, &c, None, None, Some(&a_iq), Some(&b_iq), Some(&x0), 1e-5);
+    }
+
+    /// Proximal warm-start: a tiny prox term should not move the
+    /// optimum noticeably when the original problem is already strictly
+    /// convex (unique optimum). ρ = 1e-6 is small relative to H = I.
+    #[test]
+    fn prox_weight_preserves_strict_optimum() {
+        // Same as `inequality_active_at_optimum` but with prox toward
+        // the (incorrect) origin. The strict optimum (1, 1) is unaffected
+        // up to O(ρ) bias.
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::from_vec(vec![-2.0, -2.0]);
+        let a_iq = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let b_iq = DVector::from_vec(vec![1.0, 1.0]);
+        let x0 = DVector::zeros(2);
+
+        let cfg = QpConfig {
+            prox_weight: 1e-6,
+            ..QpConfig::default()
+        };
+        let sol = solve_qp(
+            &h, &c, None, None,
+            Some(&a_iq), Some(&b_iq), Some(&x0), &cfg,
+        );
+        assert_eq!(sol.status, QpStatus::Optimal);
+        // Objective must report on the **original** cost (½‖x‖² − 2(x₁+x₂)).
+        // At x=(1,1): 0.5*(1+1) − 2*(1+1) = 1 − 4 = −3.
+        assert_relative_eq!(sol.objective, -3.0, epsilon = 5e-6);
+        assert_relative_eq!(sol.x[0], 1.0, epsilon = 1e-4);
+        assert_relative_eq!(sol.x[1], 1.0, epsilon = 1e-4);
+    }
+
+    /// Proximal warm-start: in a degenerate problem with a wide null
+    /// space, the prox term should pull the optimum toward `x0`.
+    #[test]
+    fn prox_weight_picks_solution_near_x0_in_null_space() {
+        // min 0.5*(x₁ + x₂ − 1)² (rank-1 H) — infinitely many optima
+        // along the line x₁ + x₂ = 1. Without prox the solver could
+        // pick anything on that line; with prox toward x0 = (0, 0)
+        // the unique optimum is the closest point to origin: (0.5, 0.5).
+        // We build H = aaᵀ where a = [1; 1].
+        let h = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
+        let c = DVector::from_vec(vec![-1.0, -1.0]);
+        let x0 = DVector::zeros(2);
+
+        let cfg = QpConfig {
+            prox_weight: 1e-3,
+            ..QpConfig::default()
+        };
+        let sol = solve_qp(
+            &h, &c, None, None, None, None, Some(&x0), &cfg,
+        );
+        assert_eq!(sol.status, QpStatus::Optimal);
+        // Both coordinates should be close to 0.5 (the prox-anchored
+        // closest point on the optimum line). Tolerance accounts for
+        // ρ = 1e-3 finite bias.
+        assert_relative_eq!(sol.x[0], 0.5, epsilon = 1e-2);
+        assert_relative_eq!(sol.x[1], 0.5, epsilon = 1e-2);
+    }
+
+    /// Proximal warm-start: prox_weight = 0 must keep the solver fully
+    /// backward-compatible (no augmentation, x0 retains its existing
+    /// "initial point" semantics for ActiveSet).
+    #[test]
+    fn prox_weight_zero_is_a_noop() {
+        let h = DMatrix::identity(2, 2);
+        let c = DVector::from_vec(vec![-2.0, -2.0]);
+        let a_iq = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let b_iq = DVector::from_vec(vec![1.0, 1.0]);
+        let x0 = DVector::zeros(2); // far from optimum but irrelevant
+
+        let cfg = QpConfig::default();
+        assert_eq!(cfg.prox_weight, 0.0);
+        let sol_no_x0 = solve_qp(
+            &h, &c, None, None,
+            Some(&a_iq), Some(&b_iq), None, &cfg,
+        );
+        let sol_with_x0 = solve_qp(
+            &h, &c, None, None,
+            Some(&a_iq), Some(&b_iq), Some(&x0), &cfg,
+        );
+        // Both reach the same optimum (1, 1).
+        assert_relative_eq!(sol_no_x0.x[0], sol_with_x0.x[0], epsilon = 1e-6);
+        assert_relative_eq!(sol_no_x0.x[1], sol_with_x0.x[1], epsilon = 1e-6);
+        assert_relative_eq!(sol_no_x0.objective, sol_with_x0.objective, epsilon = 1e-6);
     }
 
     #[cfg(feature = "clarabel")]
