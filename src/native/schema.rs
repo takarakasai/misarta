@@ -202,7 +202,18 @@ pub struct Link {
     /// Collision geometries. Often a coarser approximation of `visual`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collision: Vec<Collision>,
+
+    /// Whether this link participates in collision detection at all.
+    /// `false` means "render the visuals but skip every contact pair the
+    /// engine would otherwise try to evaluate" — equivalent to MuJoCo
+    /// `contype=0 conaffinity=0` on every collision geom. Defaults to
+    /// `true` so existing models keep their previous behaviour.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub collision_enabled: bool,
 }
+
+fn default_true() -> bool { true }
+fn is_true(b: &bool) -> bool { *b }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Inertial {
