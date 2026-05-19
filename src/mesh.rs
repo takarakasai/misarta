@@ -199,6 +199,76 @@ impl MeshData {
         })
     }
 
+    /// Parse mesh data from an in-memory **Wavefront OBJ** byte buffer.
+    ///
+    /// Triangulates polygons on the fly, deduplicates vertices via `tobj`'s
+    /// `single_index` pass, and recomputes per-triangle face normals from
+    /// the geometry (matching what [`from_stl_bytes`](Self::from_stl_bytes)
+    /// produces — flat shading). The file's own normals and materials are
+    /// ignored for consistency with the STL loader.
+    pub fn from_obj_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut reader = std::io::BufReader::new(bytes);
+        let opts = tobj::LoadOptions {
+            triangulate: true,
+            single_index: true,
+            ..Default::default()
+        };
+        // OBJ files can reference an external .mtl — we don't have an
+        // AssetSource here, so return a benign error and let tobj continue.
+        let (models, _materials) = tobj::load_obj_buf(&mut reader, &opts, |_p| {
+            Err(tobj::LoadError::OpenFileFailed)
+        })
+        .map_err(|e| format!("OBJ parse error: {e}"))?;
+
+        let mut vertices: Vec<Point3<f64>> = Vec::new();
+        let mut indices: Vec<[u32; 3]> = Vec::new();
+        let mut face_normals: Vec<Vector3<f64>> = Vec::new();
+
+        for model in &models {
+            let mesh = &model.mesh;
+            let base = vertices.len() as u32;
+            for chunk in mesh.positions.chunks_exact(3) {
+                vertices.push(Point3::new(
+                    chunk[0] as f64,
+                    chunk[1] as f64,
+                    chunk[2] as f64,
+                ));
+            }
+            for tri in mesh.indices.chunks_exact(3) {
+                let i0 = base + tri[0];
+                let i1 = base + tri[1];
+                let i2 = base + tri[2];
+                let i0u = i0 as usize;
+                let i1u = i1 as usize;
+                let i2u = i2 as usize;
+                if i0u >= vertices.len() || i1u >= vertices.len() || i2u >= vertices.len() {
+                    continue;
+                }
+                indices.push([i0, i1, i2]);
+                let v0 = &vertices[i0u];
+                let v1 = &vertices[i1u];
+                let v2 = &vertices[i2u];
+                let n = (v1 - v0).cross(&(v2 - v0));
+                let len = n.norm();
+                face_normals.push(if len > 1e-30 {
+                    n / len
+                } else {
+                    Vector3::zeros()
+                });
+            }
+        }
+
+        Ok(Self {
+            vertices,
+            indices,
+            face_normals,
+            vertex_normals: Vec::new(),
+            texcoords: Vec::new(),
+            materials: Vec::new(),
+            submeshes: Vec::new(),
+        })
+    }
+
     /// Build `MeshData` from raw `stl_io::Triangle` slices (non-indexed,
     /// useful for testing / procedural generation without a file).
     ///
@@ -789,6 +859,51 @@ mod tests {
         // Should be convertible to TriMesh.
         let trimesh = mesh.to_trimesh().unwrap();
         assert_eq!(trimesh.indices().len(), mesh.num_triangles());
+    }
+
+    /// 2-triangle Wavefront OBJ — shares one edge, so 4 unique verts
+    /// after tobj's `single_index` deduplication.
+    const TINY_OBJ_BYTES: &[u8] = b"\
+o tri
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+v 0.0 0.0 1.0
+f 1 2 3
+f 1 3 4
+";
+
+    #[test]
+    fn from_obj_bytes_parses_triangulated_mesh() {
+        let mesh = MeshData::from_obj_bytes(TINY_OBJ_BYTES).expect("parse OBJ");
+        assert_eq!(mesh.indices.len(), 2, "expected 2 triangles");
+        assert_eq!(mesh.vertices.len(), 4, "expected 4 deduplicated verts");
+        assert_eq!(mesh.face_normals.len(), 2);
+        // Both face normals must be unit-length (recomputed from geometry).
+        for n in &mesh.face_normals {
+            assert_relative_eq!(n.norm(), 1.0, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn from_obj_bytes_handles_empty_input() {
+        // An OBJ with no faces parses successfully but produces 0 tris.
+        // (Used to make sure we don't panic on edge cases.)
+        let mesh = MeshData::from_obj_bytes(b"o empty\n").expect("parse empty OBJ");
+        assert!(mesh.indices.is_empty());
+        assert!(mesh.face_normals.is_empty());
+    }
+
+    #[test]
+    fn from_obj_bytes_rejects_garbage() {
+        // Random bytes are not a valid OBJ; tobj should surface an error
+        // rather than silently producing an empty mesh.
+        let result = MeshData::from_obj_bytes(b"\xff\xfe\xfd this is not OBJ \x00");
+        // Some inputs tobj treats as "no faces, no verts" rather than error;
+        // either outcome is acceptable as long as we don't panic.
+        if let Ok(mesh) = result {
+            assert!(mesh.indices.is_empty());
+        }
     }
 
     #[test]

@@ -160,9 +160,9 @@ fn parse_mesh_bytes(path: &str, bytes: &[u8]) -> Result<MeshData, String> {
         .unwrap_or_default();
     match ext.as_str() {
         "stl" => MeshData::from_stl_bytes(bytes),
+        "obj" => MeshData::from_obj_bytes(bytes),
         other => Err(format!(
-            "unsupported mesh extension '.{other}' (only .stl is wired up; \
-             other formats are tracked in doc/refactor_20260502.md)"
+            "unsupported mesh extension '.{other}' (supported: stl, obj)"
         )),
     }
 }
@@ -279,15 +279,53 @@ mod tests {
 
     #[test]
     fn unsupported_extension_recorded_as_failed() {
+        // `.xyzzy` is not in the dispatcher; load_meshes should record it
+        // as failed (not crash). `.stl` and `.obj` are the supported set.
         let mut src = InMemorySource::new();
-        src.insert("meshes/foo.obj", b"v 0 0 0\n".to_vec());
+        src.insert("meshes/foo.xyzzy", b"garbage".to_vec());
         let mut geom = GeometryModel::new();
-        geom.add(mesh_object("o", "meshes/foo.obj"));
+        geom.add(mesh_object("o", "meshes/foo.xyzzy"));
 
         let report = load_meshes(&mut geom, &src).unwrap();
         assert_eq!(report.loaded, 0);
         assert_eq!(report.failed.len(), 1);
         assert!(report.failed[0].1.contains("unsupported mesh extension"));
+    }
+
+    /// A 2-triangle OBJ — enough to exercise tobj's triangulation and
+    /// vertex deduplication paths in `MeshData::from_obj_bytes`.
+    const TINY_OBJ_BYTES: &[u8] = b"\
+o tri
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+v 0.0 0.0 1.0
+f 1 2 3
+f 1 3 4
+";
+
+    #[test]
+    fn loads_obj_via_in_memory_source() {
+        // Regression: pre-fix this fell into the `unsupported extension`
+        // arm and the OBJ data was discarded.
+        let mut src = InMemorySource::new();
+        src.insert("meshes/tri.obj", TINY_OBJ_BYTES.to_vec());
+        let mut geom = GeometryModel::new();
+        geom.add(mesh_object("o", "meshes/tri.obj"));
+
+        let report = load_meshes(&mut geom, &src).unwrap();
+        assert_eq!(report.loaded, 1);
+        assert!(
+            report.is_clean(),
+            "OBJ load reported issues: missing={:?} failed={:?}",
+            report.missing, report.failed
+        );
+        let m = geom.objects[0]
+            .mesh_data
+            .as_ref()
+            .expect("mesh_data populated");
+        assert_eq!(m.indices.len(), 2, "expected 2 triangles");
+        assert_eq!(m.vertices.len(), 4, "expected 4 deduped verts");
     }
 
     #[test]
