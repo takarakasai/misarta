@@ -163,6 +163,13 @@ pub enum ActuatorMode {
     /// mode degrades to `<motor>` since the inverse dynamics live outside
     /// MuJoCo.
     ComputedTorque,
+    /// MJCF-export-only flag: the host should emit this joint as a weld
+    /// (no DoF, no actuator) in the generated MJCF. The kinematic
+    /// `joint_type` in the joint definition itself is preserved, so .misa
+    /// and URDF round-trips keep the joint movable for FK and re-export.
+    /// Intended for disabling wheel / passive joints in a single MuJoCo
+    /// session without rewriting the model.
+    Fixed,
 }
 
 impl Default for ActuatorMode {
