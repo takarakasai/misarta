@@ -595,6 +595,7 @@ pub enum GaitTypeConfig {
     Walk,
     Pace,
     Bound,
+    Crawl,
 }
 
 impl Default for GaitTypeConfig {
@@ -646,12 +647,18 @@ pub struct GaitConfigEntry {
     /// matches the analytical IK's natural sign convention.
     #[serde(default)]
     pub knee_forward: [bool; 4],
+    /// LinearCrawl-only: fraction of each per-leg sub-cycle (`T/4`)
+    /// spent in 4-support before the leg lifts. Ignored by every
+    /// other gait mode. Default `0.5`.
+    #[serde(default = "default_four_support_fraction")]
+    pub four_support_fraction: f64,
 }
 
 fn default_cycle_period() -> f64 { 0.4 }
 fn default_duty_factor() -> f64 { 0.5 }
 fn default_swing_height() -> f64 { 0.04 }
 fn default_max_step() -> f64 { 0.10 }
+fn default_four_support_fraction() -> f64 { 0.5 }
 fn default_fl_foot() -> String { "FL_foot".into() }
 fn default_fr_foot() -> String { "FR_foot".into() }
 fn default_rl_foot() -> String { "RL_foot".into() }
@@ -671,6 +678,7 @@ impl Default for GaitConfigEntry {
             rl_foot: default_rl_foot(),
             rr_foot: default_rr_foot(),
             knee_forward: [false; 4],
+            four_support_fraction: default_four_support_fraction(),
         }
     }
 }
@@ -988,6 +996,7 @@ version = 999
             rl_foot: "RL_paw".into(),
             rr_foot: "RR_paw".into(),
             knee_forward: [true, true, false, false],
+            four_support_fraction: 0.5,
         });
         let toml = cfg.to_toml().unwrap();
         let parsed = MisartaConfig::from_toml(&toml).unwrap();

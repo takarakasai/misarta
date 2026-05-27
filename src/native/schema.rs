@@ -260,6 +260,29 @@ pub struct Collision {
     #[serde(default, skip_serializing_if = "Origin::is_identity")]
     pub origin: Origin,
     pub geom: Geom,
+    /// Optional MuJoCo-specific contact physics tuning (friction,
+    /// condim, priority, solimp, margin). `None` ⇒ inherit the
+    /// MuJoCo compiler default. Absent in legacy `.misa` files
+    /// (loads as `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physics: Option<MjcfPhysics>,
+}
+
+/// Mirror of `articara::rbd::model::MjcfPhysics`. All fields optional;
+/// emitted into `.misa` only when explicitly set so existing files
+/// stay byte-identical after round-trip.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MjcfPhysics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub friction: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condim: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solimp: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin: Option<f64>,
 }
 
 // ─── Geometry tagged union ────────────────────────────────────────────────
@@ -651,6 +674,7 @@ mod tests {
                     radius: 0.04,
                     length: 0.20,
                 },
+                physics: None,
             }],
         });
         let s = toml::to_string(&f).unwrap();

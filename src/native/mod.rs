@@ -58,7 +58,7 @@ pub use report::{is_valid_identifier, sanitize_identifier, LoadReport,
 pub use schema::{
     Actuator, ActuatorJointRef, ActuatorMode, CollisionPair, ColorSpec, Gait, GaitTypeConfig,
     Geom, Home, Inertial, Joint, JointDynamics, JointKind, JointLimit, Link, LoopClosure,
-    Material, MisaFile, Mimic, Origin, Pose, RobotMeta, Sensor, SensorKind, Sequence,
+    Material, MisaFile, Mimic, MjcfPhysics, Origin, Pose, RobotMeta, Sensor, SensorKind, Sequence,
     SequenceStep, Visual, Collision, CURRENT_VERSION, SCHEMA_TAG,
 };
 pub use source::{
@@ -196,6 +196,7 @@ mod tests {
                 geom: Geom::Box {
                     size: [0.30, 0.20, 0.10],
                 },
+                physics: None,
             }],
         });
 
