@@ -176,6 +176,7 @@ mod tests {
         f.link.push(Link {
             name: "trunk".into(),
             description: String::new(),
+            collision_enabled: true,
             inertial: Inertial {
                 mass: 5.0,
                 ixx: 0.10,
@@ -204,6 +205,7 @@ mod tests {
             f.link.push(Link {
                 name: format!("{side}_thigh"),
                 description: String::new(),
+                collision_enabled: true,
                 inertial: Inertial {
                     mass: 0.8,
                     ixx: 0.01,

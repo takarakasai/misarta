@@ -653,6 +653,7 @@ mod tests {
         f.link.push(Link {
             name: "trunk".into(),
             description: String::new(),
+            collision_enabled: true,
             inertial: Inertial {
                 mass: 5.0,
                 ixx: 0.1,

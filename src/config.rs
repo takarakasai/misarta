@@ -48,6 +48,8 @@
 //!     collision_pair: vec![],
 //!     sequence: vec![],
 //!     mimic: vec![],
+//!     gait: vec![],
+//!     home: Default::default(),
 //!     sensor: vec![],
 //! };
 //! config.save("robot.misarta.toml").unwrap();
