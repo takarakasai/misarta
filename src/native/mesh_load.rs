@@ -48,9 +48,8 @@ impl MeshLoadReport {
 /// Walk a [`GeometryModel`] and load mesh data for every
 /// `GeometryShape::Mesh` whose `mesh_data` slot is still empty.
 ///
-/// Currently understands STL (`.stl`, case-insensitive). Other formats
-/// log a warning into [`MeshLoadReport::failed`] for now and remain
-/// available as a follow-up.
+/// Understands STL, OBJ and DAE (case-insensitive extensions). Other
+/// formats log a warning into [`MeshLoadReport::failed`].
 ///
 /// Mesh references are passed through [`normalise_mesh_reference`] before
 /// being handed to `assets`, so URDF-style `package://name/sub/foo.stl`
@@ -151,7 +150,7 @@ pub fn load_meshes_into(
     Ok(report)
 }
 
-/// Dispatch on extension. Currently STL only; new formats slot in here.
+/// Dispatch on extension; new formats slot in here.
 fn parse_mesh_bytes(path: &str, bytes: &[u8]) -> Result<MeshData, String> {
     let ext = path
         .rsplit('.')
@@ -161,8 +160,17 @@ fn parse_mesh_bytes(path: &str, bytes: &[u8]) -> Result<MeshData, String> {
     match ext.as_str() {
         "stl" => MeshData::from_stl_bytes(bytes),
         "obj" => MeshData::from_obj_bytes(bytes),
+        "dae" => {
+            // DAE arrives as bytes from the AssetSource, so relative
+            // texture paths inside the file cannot be resolved against a
+            // real directory — geometry loads fine, texture references
+            // stay as written.
+            let xml = std::str::from_utf8(bytes)
+                .map_err(|e| format!("DAE is not valid UTF-8: {e}"))?;
+            crate::collada::load_dae_string(xml, std::path::Path::new("."))
+        }
         other => Err(format!(
-            "unsupported mesh extension '.{other}' (supported: stl, obj)"
+            "unsupported mesh extension '.{other}' (supported: stl, obj, dae)"
         )),
     }
 }
