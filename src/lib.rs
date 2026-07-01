@@ -13,6 +13,7 @@ pub mod collision;
 pub mod rnea;
 pub mod crba;
 pub mod aba;
+pub mod analysis;
 pub mod frames;
 pub mod manifold;
 pub mod centroidal;
