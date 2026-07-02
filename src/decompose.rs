@@ -1036,6 +1036,102 @@ pub fn fit_primitive_to_points(points: &[Point3<f64>]) -> FitPrimitive {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
+// ─── Unified decomposition entry point ─────────────────────────────────────
+
+/// One shape produced by [`decompose_mesh`].
+#[derive(Debug, Clone)]
+pub enum FitShape {
+    /// A convex hull (V-HACD output).
+    Hull(MeshData),
+    /// A best-fit primitive (box / cylinder / sphere).
+    Primitive(PrimitiveKind),
+}
+
+/// One decomposed part: a shape plus its placement **relative to the
+/// source mesh's frame** (identity for hulls; PCA pose for primitives,
+/// centre offset for spheres).
+#[derive(Debug, Clone)]
+pub struct FitPart {
+    pub translation: Vector3<f64>,
+    pub rotation: nalgebra::UnitQuaternion<f64>,
+    pub shape: FitShape,
+}
+
+impl FitPart {
+    fn from_primitive(p: FitPrimitive) -> Self {
+        Self {
+            translation: p.center.coords,
+            rotation: p.rotation,
+            shape: FitShape::Primitive(p.kind),
+        }
+    }
+}
+
+/// Options for [`decompose_mesh`].
+#[derive(Default)]
+pub struct DecomposeOptions<'a> {
+    /// Cap on the number of hulls (V-HACD) or spheres (sphere tree).
+    /// `None` keeps the parameter defaults. Primitive fitting ignores it.
+    pub max_count: Option<usize>,
+    /// Coarse phase indicator (`PHASE_*` constants), polled by a UI while
+    /// the decomposition runs on a worker thread.
+    pub progress: Option<&'a Arc<AtomicU8>>,
+    /// Fine-grained 0–100 progress within the current phase.
+    pub sub_progress: Option<&'a Arc<AtomicU8>>,
+}
+
+/// Decompose `mesh` with `method`, returning uniform [`FitPart`]s
+/// regardless of which algorithm ran. This is the single entry point for
+/// UI / editor layers; the per-algorithm functions remain available for
+/// callers that need algorithm-specific types.
+pub fn decompose_mesh(
+    mesh: &MeshData,
+    method: DecompositionMethod,
+    opts: DecomposeOptions<'_>,
+) -> Vec<FitPart> {
+    match method {
+        DecompositionMethod::Vhacd => {
+            let mut params = VhacdParams::default();
+            if let Some(c) = opts.max_count {
+                params.max_hulls = c as u32;
+            }
+            vhacd_with_progress(mesh, &params, opts.progress, opts.sub_progress)
+                .into_iter()
+                .map(|h| FitPart {
+                    translation: Vector3::zeros(),
+                    rotation: nalgebra::UnitQuaternion::identity(),
+                    shape: FitShape::Hull(h),
+                })
+                .collect()
+        }
+        DecompositionMethod::SphereTree => {
+            let mut params = SphereTreeParams::default();
+            if let Some(c) = opts.max_count {
+                params.max_spheres = c;
+            }
+            sphere_tree_with_progress(mesh, &params, opts.progress, opts.sub_progress)
+                .into_iter()
+                .map(|s| FitPart {
+                    translation: s.center.coords,
+                    rotation: nalgebra::UnitQuaternion::identity(),
+                    shape: FitShape::Primitive(PrimitiveKind::Sphere { radius: s.radius }),
+                })
+                .collect()
+        }
+        DecompositionMethod::PrimitiveFit => {
+            let params = VhacdParams::default();
+            primitive_fit_with_progress(mesh, &params, opts.progress, opts.sub_progress)
+                .into_iter()
+                .map(FitPart::from_primitive)
+                .collect()
+        }
+        DecompositionMethod::PrimitiveFitDirect => {
+            let p = primitive_fit_direct_with_progress(mesh, opts.progress, opts.sub_progress);
+            vec![FitPart::from_primitive(p)]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1576,5 +1672,49 @@ mod tests {
 
         let s = PrimitiveKind::Sphere { radius: 1.0 };
         assert!((s.volume() - 4.0 / 3.0 * std::f64::consts::PI).abs() < 1e-10);
+    }
+
+    #[test]
+    fn decompose_mesh_direct_fit_returns_one_box() {
+        let mesh = make_box(0.1, 0.2, 0.3);
+        let parts = decompose_mesh(
+            &mesh,
+            DecompositionMethod::PrimitiveFitDirect,
+            DecomposeOptions::default(),
+        );
+        assert_eq!(parts.len(), 1);
+        match &parts[0].shape {
+            FitShape::Primitive(PrimitiveKind::Box { .. }) => {}
+            other => panic!("expected a box primitive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompose_mesh_sphere_tree_respects_max_count() {
+        let mesh = make_box(0.1, 0.1, 0.5);
+        let parts = decompose_mesh(
+            &mesh,
+            DecompositionMethod::SphereTree,
+            DecomposeOptions {
+                max_count: Some(4),
+                ..Default::default()
+            },
+        );
+        assert!(!parts.is_empty() && parts.len() <= 4, "got {}", parts.len());
+        assert!(parts
+            .iter()
+            .all(|p| matches!(p.shape, FitShape::Primitive(PrimitiveKind::Sphere { .. }))));
+    }
+
+    #[test]
+    fn decompose_mesh_vhacd_returns_hulls() {
+        let mesh = make_box(0.1, 0.1, 0.1);
+        let parts = decompose_mesh(
+            &mesh,
+            DecompositionMethod::Vhacd,
+            DecomposeOptions::default(),
+        );
+        assert!(!parts.is_empty());
+        assert!(parts.iter().all(|p| matches!(p.shape, FitShape::Hull(_))));
     }
 }
