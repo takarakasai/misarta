@@ -43,6 +43,7 @@
 //! ```
 
 pub mod build;
+pub mod edit;
 pub mod mesh_load;
 pub mod parse;
 pub mod report;
@@ -51,6 +52,7 @@ pub mod source;
 pub mod write;
 
 pub use build::build_model;
+pub use edit::{add_joint, add_link, remove_link, rename_joint, rename_link, EditError};
 pub use mesh_load::{load_meshes, load_meshes_into, normalise_mesh_reference, MeshLoadReport};
 pub use parse::parse_str;
 pub use report::{is_valid_identifier, sanitize_identifier, LoadReport,
