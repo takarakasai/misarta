@@ -54,171 +54,265 @@ fn validated_new_name(new: &str) -> Result<&str, EditError> {
     Ok(trimmed)
 }
 
-/// Rename a link, updating every reference in the file: `robot.root`,
-/// `joint.parent` / `joint.child`, `sensor.link`,
-/// `collision_pair.link_a` / `link_b`, `loop_closure.link_a` / `link_b`
-/// and the gait presets' four foot-link names.
+// ─── Generic core ───────────────────────────────────────────────────────────
+
+/// Access to the name-reference tables of an editable robot description.
 ///
-/// Renaming to the current name is a no-op `Ok`.
-pub fn rename_link(f: &mut MisaFile, old: &str, new: &str) -> Result<(), EditError> {
+/// The `.misa` schema and any in-memory editor model that mirrors it (e.g.
+/// articara's `RobotModel`) share the same cross-reference structure; this
+/// trait exposes just enough of it for the edit operations to run
+/// generically, so the reference-fixup invariants have exactly one
+/// implementation ([`rename_link_in`], [`rename_joint_in`],
+/// [`remove_link_in`]).
+///
+/// Contract notes:
+/// - `visit_link_name_slots` must enumerate **every** slot holding a link
+///   name, including each link's own `name` field and the root-link field.
+/// - `visit_joint_name_slots` likewise, including each joint's own `name`.
+/// - Implementations with derived indices (name → idx maps) rebuild them
+///   after the edit call returns; the core only touches the slots.
+pub trait EditTables {
+    fn root_link(&self) -> String;
+    fn has_link(&self, name: &str) -> bool;
+    fn has_joint(&self, name: &str) -> bool;
+    /// `(joint_name, parent_link, child_link)` for every joint.
+    fn joints_topology(&self) -> Vec<(String, String, String)>;
+    fn visit_link_name_slots(&mut self, f: &mut dyn FnMut(&mut String));
+    fn visit_joint_name_slots(&mut self, f: &mut dyn FnMut(&mut String));
+    /// Rekey joint-name-keyed maps (pose angles, home positions, ...).
+    fn rekey_joint_maps(&mut self, old: &str, new: &str);
+    /// Drop the named link / joint entities themselves.
+    fn remove_link_entities(&mut self, names: &[String]);
+    fn remove_joint_entities(&mut self, names: &[String]);
+    /// Drop rows that reference a link failing `keep` (sensor mounts,
+    /// collision pairs, loop closures). Gait presets are deliberately
+    /// exempt — see [`remove_link_in`].
+    fn retain_rows_by_link(&mut self, keep: &dyn Fn(&str) -> bool);
+    /// Drop joint references failing `keep`: mimic rows, actuator joint
+    /// refs (dropping actuators left empty), pose / home angle entries.
+    fn retain_rows_by_joint(&mut self, keep: &dyn Fn(&str) -> bool);
+}
+
+/// Generic [`rename_link`] over any [`EditTables`] implementation.
+pub fn rename_link_in(t: &mut dyn EditTables, old: &str, new: &str) -> Result<(), EditError> {
     let new = validated_new_name(new)?;
     if new == old {
         return Ok(());
     }
-    if f.link.iter().any(|l| l.name == new) {
-        return Err(EditError::NameCollision(new.to_string()));
-    }
-    let Some(link) = f.link.iter_mut().find(|l| l.name == old) else {
+    if !t.has_link(old) {
         return Err(EditError::UnknownLink(old.to_string()));
-    };
-
-    link.name = new.to_string();
-    if f.robot.root == old {
-        f.robot.root = new.to_string();
     }
-    for j in &mut f.joint {
-        if j.parent == old {
-            j.parent = new.to_string();
-        }
-        if j.child == old {
-            j.child = new.to_string();
-        }
+    if t.has_link(new) {
+        return Err(EditError::NameCollision(new.to_string()));
     }
-    for s in &mut f.sensor {
-        if s.link == old {
-            s.link = new.to_string();
+    t.visit_link_name_slots(&mut |slot| {
+        if slot == old {
+            *slot = new.to_string();
         }
-    }
-    for cp in &mut f.collision_pair {
-        if cp.link_a == old {
-            cp.link_a = new.to_string();
-        }
-        if cp.link_b == old {
-            cp.link_b = new.to_string();
-        }
-    }
-    for lc in &mut f.loop_closure {
-        if lc.link_a == old {
-            lc.link_a = new.to_string();
-        }
-        if lc.link_b == old {
-            lc.link_b = new.to_string();
-        }
-    }
-    for g in &mut f.gait {
-        for foot in [&mut g.fl_foot, &mut g.fr_foot, &mut g.rl_foot, &mut g.rr_foot] {
-            if foot == old {
-                *foot = new.to_string();
-            }
-        }
-    }
+    });
     Ok(())
 }
 
-/// Rename a joint, updating every reference: `mimic.joint` /
-/// `mimic.source`, actuator joint refs, and the joint-name keys of every
-/// pose's `angles` map and of `home.joint_positions`.
-///
-/// Renaming to the current name is a no-op `Ok`.
-pub fn rename_joint(f: &mut MisaFile, old: &str, new: &str) -> Result<(), EditError> {
+/// Generic [`rename_joint`] over any [`EditTables`] implementation.
+pub fn rename_joint_in(t: &mut dyn EditTables, old: &str, new: &str) -> Result<(), EditError> {
     let new = validated_new_name(new)?;
     if new == old {
         return Ok(());
     }
-    if f.joint.iter().any(|j| j.name == new) {
+    if !t.has_joint(old) {
+        return Err(EditError::UnknownJoint(old.to_string()));
+    }
+    if t.has_joint(new) {
         return Err(EditError::NameCollision(new.to_string()));
     }
-    let Some(joint) = f.joint.iter_mut().find(|j| j.name == old) else {
-        return Err(EditError::UnknownJoint(old.to_string()));
-    };
-
-    joint.name = new.to_string();
-    for m in &mut f.mimic {
-        if m.joint == old {
-            m.joint = new.to_string();
+    t.visit_joint_name_slots(&mut |slot| {
+        if slot == old {
+            *slot = new.to_string();
         }
-        if m.source == old {
-            m.source = new.to_string();
-        }
-    }
-    for a in &mut f.actuator {
-        for jr in &mut a.joints {
-            if jr.name == old {
-                jr.name = new.to_string();
-            }
-        }
-    }
-    for p in &mut f.pose {
-        if let Some(v) = p.angles.remove(old) {
-            p.angles.insert(new.to_string(), v);
-        }
-    }
-    if let Some(v) = f.home.joint_positions.remove(old) {
-        f.home.joint_positions.insert(new.to_string(), v);
-    }
+    });
+    t.rekey_joint_maps(old, new);
     Ok(())
 }
 
-/// Remove a link and its entire subtree. Returns the removed link names
-/// (the requested link first).
-///
-/// Every reference to a removed link or to one of the removed joints is
-/// cleaned up: sensors on removed links, collision pairs / loop closures
-/// touching them, mimics whose follower or source joint disappeared,
-/// actuator joint refs (an actuator left with no joints is dropped), and
-/// pose / home angle entries of removed joints. Gait presets are left
-/// untouched — they are user-authored presets whose foot fields fall back
-/// to schema defaults, and silently deleting a preset would lose data the
-/// user may want to re-point instead.
-pub fn remove_link(f: &mut MisaFile, name: &str) -> Result<Vec<String>, EditError> {
-    if f.robot.root == name {
+/// Generic [`remove_link`] over any [`EditTables`] implementation.
+pub fn remove_link_in(t: &mut dyn EditTables, name: &str) -> Result<Vec<String>, EditError> {
+    if t.root_link() == name {
         return Err(EditError::RootRemoval);
     }
-    if !f.link.iter().any(|l| l.name == name) {
+    if !t.has_link(name) {
         return Err(EditError::UnknownLink(name.to_string()));
     }
+
+    let topo = t.joints_topology();
 
     // Collect the subtree: `name` plus everything reachable through joints.
     let mut removed_links: Vec<String> = vec![name.to_string()];
     let mut frontier = vec![name.to_string()];
     while let Some(parent) = frontier.pop() {
-        for j in &f.joint {
-            if j.parent == parent && !removed_links.contains(&j.child) {
-                removed_links.push(j.child.clone());
-                frontier.push(j.child.clone());
+        for (_, p, c) in &topo {
+            if *p == parent && !removed_links.contains(c) {
+                removed_links.push(c.clone());
+                frontier.push(c.clone());
+            }
+        }
+    }
+    let is_removed = |n: &str| removed_links.iter().any(|r| r == n);
+
+    let removed_joints: Vec<String> = topo
+        .iter()
+        .filter(|(_, p, c)| is_removed(p) || is_removed(c))
+        .map(|(n, _, _)| n.clone())
+        .collect();
+    let joint_removed = |n: &str| removed_joints.iter().any(|r| r == n);
+
+    t.remove_joint_entities(&removed_joints);
+    t.remove_link_entities(&removed_links);
+    t.retain_rows_by_link(&|n| !is_removed(n));
+    t.retain_rows_by_joint(&|n| !joint_removed(n));
+
+    Ok(removed_links)
+}
+
+// ─── EditTables for MisaFile ────────────────────────────────────────────────
+
+impl EditTables for MisaFile {
+    fn root_link(&self) -> String {
+        self.robot.root.clone()
+    }
+
+    fn has_link(&self, name: &str) -> bool {
+        self.link.iter().any(|l| l.name == name)
+    }
+
+    fn has_joint(&self, name: &str) -> bool {
+        self.joint.iter().any(|j| j.name == name)
+    }
+
+    fn joints_topology(&self) -> Vec<(String, String, String)> {
+        self.joint
+            .iter()
+            .map(|j| (j.name.clone(), j.parent.clone(), j.child.clone()))
+            .collect()
+    }
+
+    fn visit_link_name_slots(&mut self, f: &mut dyn FnMut(&mut String)) {
+        for l in &mut self.link {
+            f(&mut l.name);
+        }
+        f(&mut self.robot.root);
+        for j in &mut self.joint {
+            f(&mut j.parent);
+            f(&mut j.child);
+        }
+        for s in &mut self.sensor {
+            f(&mut s.link);
+        }
+        for cp in &mut self.collision_pair {
+            f(&mut cp.link_a);
+            f(&mut cp.link_b);
+        }
+        for lc in &mut self.loop_closure {
+            f(&mut lc.link_a);
+            f(&mut lc.link_b);
+        }
+        for g in &mut self.gait {
+            f(&mut g.fl_foot);
+            f(&mut g.fr_foot);
+            f(&mut g.rl_foot);
+            f(&mut g.rr_foot);
+        }
+    }
+
+    fn visit_joint_name_slots(&mut self, f: &mut dyn FnMut(&mut String)) {
+        for j in &mut self.joint {
+            f(&mut j.name);
+        }
+        for m in &mut self.mimic {
+            f(&mut m.joint);
+            f(&mut m.source);
+        }
+        for a in &mut self.actuator {
+            for jr in &mut a.joints {
+                f(&mut jr.name);
             }
         }
     }
 
-    let is_removed = |n: &str| removed_links.iter().any(|r| r == n);
-
-    let removed_joints: Vec<String> = f
-        .joint
-        .iter()
-        .filter(|j| is_removed(&j.parent) || is_removed(&j.child))
-        .map(|j| j.name.clone())
-        .collect();
-    let joint_removed = |n: &str| removed_joints.iter().any(|r| r == n);
-
-    f.joint.retain(|j| !joint_removed(&j.name));
-    f.link.retain(|l| !is_removed(&l.name));
-    f.sensor.retain(|s| !is_removed(&s.link));
-    f.collision_pair
-        .retain(|cp| !is_removed(&cp.link_a) && !is_removed(&cp.link_b));
-    f.loop_closure
-        .retain(|lc| !is_removed(&lc.link_a) && !is_removed(&lc.link_b));
-    f.mimic
-        .retain(|m| !joint_removed(&m.joint) && !joint_removed(&m.source));
-    for a in &mut f.actuator {
-        a.joints.retain(|jr| !joint_removed(&jr.name));
+    fn rekey_joint_maps(&mut self, old: &str, new: &str) {
+        for p in &mut self.pose {
+            if let Some(v) = p.angles.remove(old) {
+                p.angles.insert(new.to_string(), v);
+            }
+        }
+        if let Some(v) = self.home.joint_positions.remove(old) {
+            self.home.joint_positions.insert(new.to_string(), v);
+        }
     }
-    f.actuator.retain(|a| !a.joints.is_empty());
-    for p in &mut f.pose {
-        p.angles.retain(|k, _| !joint_removed(k));
-    }
-    f.home.joint_positions.retain(|k, _| !joint_removed(k));
 
-    Ok(removed_links)
+    fn remove_link_entities(&mut self, names: &[String]) {
+        self.link.retain(|l| !names.contains(&l.name));
+    }
+
+    fn remove_joint_entities(&mut self, names: &[String]) {
+        self.joint.retain(|j| !names.contains(&j.name));
+    }
+
+    fn retain_rows_by_link(&mut self, keep: &dyn Fn(&str) -> bool) {
+        self.sensor.retain(|s| keep(&s.link));
+        self.collision_pair
+            .retain(|cp| keep(&cp.link_a) && keep(&cp.link_b));
+        self.loop_closure
+            .retain(|lc| keep(&lc.link_a) && keep(&lc.link_b));
+    }
+
+    fn retain_rows_by_joint(&mut self, keep: &dyn Fn(&str) -> bool) {
+        self.mimic.retain(|m| keep(&m.joint) && keep(&m.source));
+        for a in &mut self.actuator {
+            a.joints.retain(|jr| keep(&jr.name));
+        }
+        self.actuator.retain(|a| !a.joints.is_empty());
+        for p in &mut self.pose {
+            p.angles.retain(|k, _| keep(k));
+        }
+        self.home.joint_positions.retain(|k, _| keep(k));
+    }
+}
+
+/// Rename a link in a [`MisaFile`], updating every reference: `robot.root`,
+/// `joint.parent` / `joint.child`, `sensor.link`,
+/// `collision_pair.link_a` / `link_b`, `loop_closure.link_a` / `link_b`
+/// and the gait presets' four foot-link names.
+///
+/// Renaming to the current name is a no-op `Ok`. Thin wrapper over
+/// [`rename_link_in`], which any [`EditTables`] implementation can use.
+pub fn rename_link(f: &mut MisaFile, old: &str, new: &str) -> Result<(), EditError> {
+    rename_link_in(f, old, new)
+}
+
+/// Rename a joint in a [`MisaFile`], updating every reference:
+/// `mimic.joint` / `mimic.source`, actuator joint refs, and the
+/// joint-name keys of every pose's `angles` map and of
+/// `home.joint_positions`.
+///
+/// Renaming to the current name is a no-op `Ok`. Thin wrapper over
+/// [`rename_joint_in`].
+pub fn rename_joint(f: &mut MisaFile, old: &str, new: &str) -> Result<(), EditError> {
+    rename_joint_in(f, old, new)
+}
+
+/// Remove a link and its entire subtree from a [`MisaFile`]. Returns the
+/// removed link names (the requested link first).
+///
+/// Every reference to a removed link or joint is cleaned up: sensors on
+/// removed links, collision pairs / loop closures touching them, mimics
+/// whose follower or source joint disappeared, actuator joint refs (an
+/// actuator left with no joints is dropped), and pose / home angle
+/// entries of removed joints. Gait presets are left untouched — they are
+/// user-authored presets whose foot fields fall back to schema defaults,
+/// and silently deleting a preset would lose data the user may want to
+/// re-point instead. Thin wrapper over [`remove_link_in`].
+pub fn remove_link(f: &mut MisaFile, name: &str) -> Result<Vec<String>, EditError> {
+    remove_link_in(f, name)
 }
 
 /// Add a link. Fails on a name collision.
