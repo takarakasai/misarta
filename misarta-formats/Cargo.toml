@@ -1,0 +1,11 @@
+[package]
+name = "misarta-formats"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+description = "Foreign robot-description format conversions for misarta: MJCF / USD (and, eventually, URDF / SDF) to and from the .misa master schema (MisaFile) and the computational Model. Kept out of the misarta core so numeric consumers don't rebuild parsers, and so format churn doesn't move the core's revision."
+
+[dependencies]
+misarta = { path = ".." }
+roxmltree = "0.20"

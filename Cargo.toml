@@ -24,3 +24,6 @@ approx = "0.5"
 
 [features]
 clarabel = ["dep:clarabel"]
+
+[workspace]
+members = [".", "misarta-formats"]
