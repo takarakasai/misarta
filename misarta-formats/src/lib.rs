@@ -8,7 +8,14 @@
 //! [`misarta::native::MisaFile`]:
 //!
 //! - `mjcf` — MuJoCo XML (A4, ported from articara)
-//! - `usd`  — USD ASCII (A5)
-//! - `urdf` / `sdf` — to be moved here from the misarta core (A5)
+//! - `usd`  — USD ASCII (A5, ported from articara)
+//! - `urdf` / `sdf` — moved here from the misarta core (A5). These are
+//!   direct `Model<f64>` loaders/writers; `sdf` additionally converts
+//!   to / from [`misarta::native::MisaFile`].
+
+mod util;
 
 pub mod mjcf;
+pub mod sdf;
+pub mod urdf;
+pub mod usd;

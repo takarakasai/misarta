@@ -13,23 +13,24 @@
 //! # Example
 //!
 //! ```no_run
-//! use misarta::urdf;
+//! use misarta_formats::urdf;
 //! let xml = std::fs::read_to_string("robot.urdf").unwrap();
 //! let model = urdf::load_urdf_string(&xml).unwrap();
 //! ```
 //!
-//! # Loading meshes via [`AssetSource`](crate::native::AssetSource)
+//! # Loading meshes via [`AssetSource`](misarta::native::AssetSource)
 //!
 //! [`load_urdf_geometry_string`] populates each `GeometryObject` with
 //! its `mesh_path` (verbatim from the URDF, often
 //! `package://<pkg>/sub/foo.stl`) and leaves `mesh_data` empty.
-//! [`crate::native::load_meshes`] handles those references through any
-//! [`AssetSource`](crate::native::AssetSource) — `package://` and
+//! [`misarta::native::load_meshes`] handles those references through any
+//! [`AssetSource`](misarta::native::AssetSource) — `package://` and
 //! `file://` prefixes are stripped automatically by
-//! [`crate::native::normalise_mesh_reference`].
+//! [`misarta::native::normalise_mesh_reference`].
 //!
 //! ```no_run
-//! use misarta::{urdf, native};
+//! use misarta_formats::urdf;
+//! use misarta::native;
 //! let xml = std::fs::read_to_string("robot.urdf").unwrap();
 //! let (model, mut visual, mut collision) =
 //!     urdf::load_urdf_geometry_string(&xml).unwrap();
@@ -40,10 +41,10 @@
 //! let _crep = native::load_meshes(&mut collision, &assets).unwrap();
 //! ```
 
-use crate::geometry::{GeometryModel, GeometryObject, GeometryShape};
-use crate::joint::JointType;
-use crate::model::{LinkInertia, Model, ModelBuilder};
-use crate::se3;
+use misarta::geometry::{GeometryModel, GeometryObject, GeometryShape};
+use misarta::joint::JointType;
+use misarta::model::{LinkInertia, Model, ModelBuilder};
+use misarta::se3;
 use nalgebra::{Matrix3, Rotation3, Vector3};
 use roxmltree::Document;
 use std::collections::HashMap;
@@ -769,10 +770,10 @@ mod tests {
     #[test]
     fn urdf_placement() {
         let model = load_urdf_string(SIMPLE_URDF).unwrap();
-        let t1 = crate::se3::translation(&model.joints[1].placement);
+        let t1 = misarta::se3::translation(&model.joints[1].placement);
         assert_relative_eq!(t1, Vector3::new(0.0, 0.0, 0.05), epsilon = 1e-12);
 
-        let t2 = crate::se3::translation(&model.joints[2].placement);
+        let t2 = misarta::se3::translation(&model.joints[2].placement);
         assert_relative_eq!(t2, Vector3::new(0.0, 0.0, 0.2), epsilon = 1e-12);
     }
 
@@ -859,14 +860,14 @@ mod tests {
         // FK from URDF should match a manually-built model.
         let model = load_urdf_string(SIMPLE_URDF).unwrap();
         let q = vec![0.3, -0.5];
-        let data = crate::fk::forward_kinematics(&model, &q);
+        let data = misarta::fk::forward_kinematics(&model, &q);
 
         // Build the equivalent model by hand.
-        let offset1 = crate::se3::from_rotation_and_translation(
+        let offset1 = misarta::se3::from_rotation_and_translation(
             &Rotation3::identity(),
             &Vector3::new(0.0, 0.0, 0.05),
         );
-        let offset2 = crate::se3::from_rotation_and_translation(
+        let offset2 = misarta::se3::from_rotation_and_translation(
             &Rotation3::identity(),
             &Vector3::new(0.0, 0.0, 0.2),
         );
@@ -890,12 +891,12 @@ mod tests {
                 LinkInertia::zero(),
             )
             .build();
-        let data_manual = crate::fk::forward_kinematics(&manual, &q);
+        let data_manual = misarta::fk::forward_kinematics(&manual, &q);
 
         for i in 1..model.joints.len() {
             assert_relative_eq!(
-                crate::se3::to_homogeneous(&data.oMi[i]),
-                crate::se3::to_homogeneous(&data_manual.oMi[i]),
+                misarta::se3::to_homogeneous(&data.oMi[i]),
+                misarta::se3::to_homogeneous(&data_manual.oMi[i]),
                 epsilon = 1e-12,
             );
         }

@@ -1,7 +1,7 @@
 //! Convert a parsed [`MisaFile`] into runtime [`Model`] +
 //! [`GeometryModel`]s.
 //!
-//! Mirrors the post-parse step in [`crate::urdf::load_urdf_string`]:
+//! Mirrors the post-parse step in `misarta-formats`'s `urdf::load_urdf_string`:
 //! topologically sort joints from the root link, feed them into
 //! [`ModelBuilder`], then apply mimic constraints in a second pass.
 //! Visual / collision geometries become [`GeometryObject`]s attached to
