@@ -8,4 +8,5 @@ description = "Foreign robot-description format conversions for misarta: MJCF / 
 
 [dependencies]
 misarta = { path = ".." }
+nalgebra = "0.34.2"
 roxmltree = "0.20"

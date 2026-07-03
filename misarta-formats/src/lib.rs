@@ -7,10 +7,8 @@
 //! ecosystems live here and convert to / from
 //! [`misarta::native::MisaFile`]:
 //!
-//! - `mjcf` — MuJoCo XML (A4, porting from articara)
+//! - `mjcf` — MuJoCo XML (A4, ported from articara)
 //! - `usd`  — USD ASCII (A5)
 //! - `urdf` / `sdf` — to be moved here from the misarta core (A5)
 
-// Modules land with A4 / A5:
-// pub mod mjcf;
-// pub mod usd;
+pub mod mjcf;
