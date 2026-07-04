@@ -1,0 +1,25 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warning-zero policy: any rustc warning in this repo is a regression.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # All members incl. the non-default misarta-py (pyo3; check does
+      # not link, so no Python shared library is needed).
+      - name: Check (workspace, all targets, all features)
+        run: cargo check --workspace --all-targets --all-features
+      # Default members only: misarta + misarta-formats. misarta-py is
+      # excluded — linking a pyo3 extension-module test binary fails by
+      # design; its pytest suite runs via maturin locally.
+      - name: Test
+        run: cargo test
