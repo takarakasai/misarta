@@ -1,5 +1,7 @@
 # misarta
 
+[![CI](https://github.com/takarakasai/misarta/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/misarta/actions/workflows/ci.yml)
+
 **misarta** は Rust 製の剛体力学ライブラリです。C++ の [Pinocchio](https://github.com/stack-of-tasks/pinocchio) と同等の運動学・動力学・最適化機能を提供します。
 
 - **名前の由来**: misa (Misato) + art (Articulation) + ta (Takara)
