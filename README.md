@@ -1,6 +1,6 @@
 # misarta
 
-[![CI](https://github.com/takarakasai/misarta/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/misarta/actions/workflows/ci.yml)
+[![CI](https://github.com/takarakasai/misarta/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/misarta/actions/workflows/ci.yml) [![coverage](https://codecov.io/gh/takarakasai/misarta/graph/badge.svg)](https://codecov.io/gh/takarakasai/misarta)
 
 **misarta** は Rust 製の剛体力学ライブラリです。C++ の [Pinocchio](https://github.com/stack-of-tasks/pinocchio) と同等の運動学・動力学・最適化機能を提供します。
 
