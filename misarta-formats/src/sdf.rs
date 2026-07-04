@@ -46,9 +46,11 @@
 
 use misarta::geometry::{GeometryModel, GeometryObject, GeometryShape};
 use misarta::joint::JointType;
-use misarta::model::{LinkInertia, Model, ModelBuilder};
+use misarta::model::Model;
 use misarta::se3;
-use nalgebra::{Matrix3, Rotation3, Vector3};
+use nalgebra::Rotation3;
+#[cfg(test)]
+use nalgebra::Vector3;
 use roxmltree::Document;
 use std::collections::HashMap;
 
