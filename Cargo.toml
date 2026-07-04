@@ -26,4 +26,7 @@ approx = "0.5"
 clarabel = ["dep:clarabel"]
 
 [workspace]
-members = [".", "misarta-formats"]
+members = [".", "misarta-formats", "misarta-py"]
+# misarta-py (pyo3 cdylib) is built on demand via `cargo check -p misarta-py`
+# or maturin; keep routine builds/tests to the Rust-only crates.
+default-members = [".", "misarta-formats"]

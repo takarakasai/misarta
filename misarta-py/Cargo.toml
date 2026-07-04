@@ -1,0 +1,18 @@
+[package]
+name = "misarta-py"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for misarta (Rust rigid-body dynamics library)."
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+
+[lib]
+name = "_misarta"
+crate-type = ["cdylib"]
+
+[dependencies]
+misarta  = { path = ".." }
+misarta-formats = { path = "../misarta-formats" }
+nalgebra = "0.34.2"
+pyo3     = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+numpy    = "0.22"
