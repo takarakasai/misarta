@@ -99,402 +99,41 @@ pub fn load_sdf_geometry(
 
 /// Load a `Model<f64>` together with visual and collision `GeometryModel`s
 /// from an SDF XML string.
+///
+/// Thin wrapper over the `.misa` conversion pipeline: the SDF is first
+/// converted to a [`MisaFile`] via [`import_str`], then realised with
+/// [`misarta::native::build_model`] — the same path the hosts use, so
+/// the tree has exactly one SDF parser. Two consequences vs. the old
+/// dedicated loader: geometry objects follow the native
+/// `<link>_visual_<i>` / `<link>_collision_<i>` naming (SDF `name`
+/// attributes are not part of the `.misa` schema), and mesh `<uri>`s
+/// are normalised to SDF-directory-relative paths (`model://x` → `x`,
+/// `package://pkg/rel` → `../rel`, `file:///abs` → `/abs`).
 pub fn load_sdf_geometry_string(
     xml: &str,
 ) -> Result<(Model<f64>, GeometryModel, GeometryModel), SdfError> {
-    let doc = Document::parse(xml).map_err(|e| SdfError::XmlParse(e.to_string()))?;
-    let sdf_root = doc.root_element();
-    if sdf_root.tag_name().name() != "sdf" {
-        return Err(SdfError::MissingElement("root <sdf> element".into()));
-    }
-    let model_el = sdf_root
-        .children()
-        .find(|n| n.tag_name().name() == "model")
-        .ok_or_else(|| SdfError::MissingElement("<model> inside <sdf>".into()))?;
-
-    // Build kinematic model via the existing parser
-    let model = load_sdf_string(xml)?;
-
-    // Build link_name → joint index map
-    let mut link_to_idx: HashMap<&str, usize> = HashMap::new();
-    for (i, name) in model.link_names.iter().enumerate() {
-        link_to_idx.insert(name.as_str(), i);
-    }
-
-    let mut visual_model = GeometryModel::new();
-    let mut collision_model = GeometryModel::new();
-
-    for link_el in model_el
-        .children()
-        .filter(|n| n.tag_name().name() == "link")
-    {
-        let link_name = link_el
-            .attribute("name")
-            .ok_or_else(|| SdfError::MissingElement("link name".into()))?;
-        let joint_idx = *link_to_idx
-            .get(link_name)
-            .ok_or_else(|| SdfError::Topology(format!("link '{link_name}' not in model")))?;
-
-        // Visual geometries
-        for (vi, vis_el) in link_el
-            .children()
-            .filter(|n| n.tag_name().name() == "visual")
-            .enumerate()
-        {
-            let placement = parse_pose_element(&vis_el);
-            if let Some(shape) = parse_sdf_geometry(&vis_el) {
-                let obj_name = vis_el
-                    .attribute("name")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{link_name}_visual_{vi}"));
-                let (mesh_path, mesh_scale) = extract_mesh_info(&shape);
-                visual_model.add(GeometryObject {
-                    name: obj_name,
-                    parent_joint: joint_idx,
-                    placement,
-                    shape,
-                    mesh_path,
-                    mesh_scale,
-                    mesh_data: None,
-            material: None,
-                });
-            }
-        }
-
-        // Collision geometries
-        for (ci, col_el) in link_el
-            .children()
-            .filter(|n| n.tag_name().name() == "collision")
-            .enumerate()
-        {
-            let placement = parse_pose_element(&col_el);
-            if let Some(shape) = parse_sdf_geometry(&col_el) {
-                let obj_name = col_el
-                    .attribute("name")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{link_name}_collision_{ci}"));
-                let (mesh_path, mesh_scale) = extract_mesh_info(&shape);
-                collision_model.add(GeometryObject {
-                    name: obj_name,
-                    parent_joint: joint_idx,
-                    placement,
-                    shape,
-                    mesh_path,
-                    mesh_scale,
-                    mesh_data: None,
-            material: None,
-                });
-            }
-        }
-    }
-
-    Ok((model, visual_model, collision_model))
+    let import = import_str(xml).map_err(import_err_to_sdf)?;
+    misarta::native::build_model(&import.file)
+        .map_err(|e| SdfError::Topology(e.to_string()))
 }
 
-/// Load a `Model<f64>` from an SDF XML string.
+/// Load a `Model<f64>` from an SDF XML string. See
+/// [`load_sdf_geometry_string`] for the conversion pipeline.
 ///
 /// If the SDF contains multiple `<model>` elements, only the first is loaded.
 pub fn load_sdf_string(xml: &str) -> Result<Model<f64>, SdfError> {
-    let doc = Document::parse(xml).map_err(|e| SdfError::XmlParse(e.to_string()))?;
-    let sdf_root = doc.root_element();
-    if sdf_root.tag_name().name() != "sdf" {
-        return Err(SdfError::MissingElement("root <sdf> element".into()));
-    }
-
-    let model_el = sdf_root
-        .children()
-        .find(|n| n.tag_name().name() == "model")
-        .ok_or_else(|| SdfError::MissingElement("<model> inside <sdf>".into()))?;
-
-    // ── Collect links ───────────────────────────────────────────────────
-    let mut link_inertias: HashMap<String, LinkInertia<f64>> = HashMap::new();
-    for link_el in model_el
-        .children()
-        .filter(|n| n.tag_name().name() == "link")
-    {
-        let name = link_el
-            .attribute("name")
-            .ok_or_else(|| SdfError::MissingElement("link name".into()))?
-            .to_string();
-        let inertia = parse_link_inertia(&link_el);
-        link_inertias.insert(name, inertia);
-    }
-
-    // ── Collect joints ──────────────────────────────────────────────────
-    struct JointInfo {
-        name: String,
-        joint_type: JointType<f64>,
-        parent_link: String,
-        child_link: String,
-        pose: nalgebra::Isometry3<f64>,
-    }
-
-    let mut joints: Vec<JointInfo> = Vec::new();
-    for joint_el in model_el
-        .children()
-        .filter(|n| n.tag_name().name() == "joint")
-    {
-        let name = joint_el
-            .attribute("name")
-            .ok_or_else(|| SdfError::MissingElement("joint name".into()))?
-            .to_string();
-        let jtype_str = joint_el
-            .attribute("type")
-            .ok_or_else(|| SdfError::MissingElement(format!("joint type for '{name}'")))?;
-
-        let parent_link = child_text(&joint_el, "parent")
-            .ok_or_else(|| SdfError::MissingElement(format!("parent for '{name}'")))?;
-
-        let child_link = child_text(&joint_el, "child")
-            .ok_or_else(|| SdfError::MissingElement(format!("child for '{name}'")))?;
-
-        let pose = parse_pose_element(&joint_el);
-        let axis = parse_axis_sdf(&joint_el);
-
-        let joint_type = match jtype_str {
-            "revolute" => JointType::Revolute { axis },
-            "prismatic" => JointType::Prismatic { axis },
-            "fixed" => JointType::Fixed,
-            "ball" | "universal" | "floating" => JointType::FreeFlyer,
-            other => return Err(SdfError::UnsupportedJointType(other.to_string())),
-        };
-
-        joints.push(JointInfo {
-            name,
-            joint_type,
-            parent_link,
-            child_link,
-            pose,
-        });
-    }
-
-    // ── Find root link ──────────────────────────────────────────────────
-    let child_links: std::collections::HashSet<&str> =
-        joints.iter().map(|j| j.child_link.as_str()).collect();
-    let root_link = link_inertias
-        .keys()
-        .find(|name| !child_links.contains(name.as_str()))
-        .ok_or_else(|| SdfError::Topology("no root link found".into()))?
-        .clone();
-
-    // ── BFS topological order ───────────────────────────────────────────
-    let mut link_to_idx: HashMap<String, usize> = HashMap::new();
-    link_to_idx.insert(root_link.clone(), 0);
-
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(root_link.clone());
-    let mut ordered_joints: Vec<&JointInfo> = Vec::new();
-
-    while let Some(parent_name) = queue.pop_front() {
-        for ji in &joints {
-            if ji.parent_link == parent_name && !link_to_idx.contains_key(&ji.child_link) {
-                ordered_joints.push(ji);
-                let idx = link_to_idx.len();
-                link_to_idx.insert(ji.child_link.clone(), idx);
-                queue.push_back(ji.child_link.clone());
-            }
-        }
-    }
-
-    if ordered_joints.len() != joints.len() {
-        return Err(SdfError::Topology(
-            "some joints could not be reached from root link".into(),
-        ));
-    }
-
-    // ── Build model ─────────────────────────────────────────────────────
-    let model_name = model_el.attribute("name").unwrap_or("").to_string();
-    let mut builder = ModelBuilder::new()
-        .name(model_name)
-        .root_link_name(root_link.clone());
-    for ji in &ordered_joints {
-        let parent_idx = link_to_idx[&ji.parent_link];
-        let inertia = link_inertias
-            .get(&ji.child_link)
-            .cloned()
-            .unwrap_or_else(LinkInertia::zero);
-
-        // In SDF, <joint><pose> is typically relative to the child link frame,
-        // and for simple cases it matches the joint origin in the parent frame.
-        // We use it directly as the parent→joint placement, which is correct
-        // when the joint pose is expressed relative to the parent (the common case
-        // for simple SDF files without nested model frames).
-        builder = builder.add_joint_with_link(
-            ji.name.clone(),
-            parent_idx,
-            ji.joint_type.clone(),
-            ji.pose,
-            inertia,
-            ji.child_link.clone(),
-        );
-    }
-
-    Ok(builder.build())
+    Ok(load_sdf_geometry_string(xml)?.0)
 }
 
-// ─── Internal helpers ───────────────────────────────────────────────────────
-
-/// Parse a `<pose>x y z roll pitch yaw</pose>` element.
-fn parse_pose_element(parent: &roxmltree::Node) -> nalgebra::Isometry3<f64> {
-    if let Some(pose_el) = parent.children().find(|n| n.tag_name().name() == "pose") {
-        if let Some(text) = pose_el.text() {
-            let vals: Vec<f64> = text.split_whitespace().filter_map(|v| v.parse().ok()).collect();
-            if vals.len() >= 6 {
-                let t = Vector3::new(vals[0], vals[1], vals[2]);
-                let rot = Rotation3::from_euler_angles(vals[3], vals[4], vals[5]);
-                return se3::from_rotation_and_translation(&rot, &t);
-            }
-        }
-    }
-    se3::identity()
-}
-
-/// Parse `<axis><xyz>x y z</xyz></axis>`.
-fn parse_axis_sdf(parent: &roxmltree::Node) -> Vector3<f64> {
-    if let Some(axis_el) = parent.children().find(|n| n.tag_name().name() == "axis") {
-        if let Some(xyz_text) = child_text(&axis_el, "xyz") {
-            let v = parse_vec3(&xyz_text);
-            let n = v.norm();
-            if n > 1e-12 {
-                return v / n;
-            }
-        }
-    }
-    Vector3::z()
-}
-
-/// Parse `<inertial>` for an SDF link.
-fn parse_link_inertia(link_el: &roxmltree::Node) -> LinkInertia<f64> {
-    if let Some(inertial) = link_el
-        .children()
-        .find(|n| n.tag_name().name() == "inertial")
-    {
-        let mass = child_text(&inertial, "mass")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-
-        let com = if let Some(pose_el) = inertial
-            .children()
-            .find(|n| n.tag_name().name() == "pose")
-        {
-            if let Some(text) = pose_el.text() {
-                let vals: Vec<f64> =
-                    text.split_whitespace().filter_map(|v| v.parse().ok()).collect();
-                if vals.len() >= 3 {
-                    Vector3::new(vals[0], vals[1], vals[2])
-                } else {
-                    Vector3::zeros()
-                }
-            } else {
-                Vector3::zeros()
-            }
-        } else {
-            Vector3::zeros()
-        };
-
-        let rotational_inertia = if let Some(inertia_el) = inertial
-            .children()
-            .find(|n| n.tag_name().name() == "inertia")
-        {
-            let ixx = child_text(&inertia_el, "ixx").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let ixy = child_text(&inertia_el, "ixy").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let ixz = child_text(&inertia_el, "ixz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let iyy = child_text(&inertia_el, "iyy").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let iyz = child_text(&inertia_el, "iyz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let izz = child_text(&inertia_el, "izz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            Matrix3::new(ixx, ixy, ixz, ixy, iyy, iyz, ixz, iyz, izz)
-        } else {
-            Matrix3::zeros()
-        };
-
-        LinkInertia {
-            mass,
-            center_of_mass: com,
-            rotational_inertia,
-        }
+/// Map an [`import_str`] error string onto the closest [`SdfError`]
+/// variant so the loader API keeps its typed errors.
+fn import_err_to_sdf(e: String) -> SdfError {
+    if let Some(msg) = e.strip_prefix("Parse SDF XML: ") {
+        SdfError::XmlParse(msg.to_string())
+    } else if e.starts_with("No <model>") {
+        SdfError::MissingElement("<model> element".into())
     } else {
-        LinkInertia::zero()
-    }
-}
-
-/// Get the text content of a named child element.
-fn child_text(parent: &roxmltree::Node, tag: &str) -> Option<String> {
-    parent
-        .children()
-        .find(|n| n.tag_name().name() == tag)
-        .and_then(|n| n.text())
-        .map(|s| s.trim().to_string())
-}
-
-/// Parse a whitespace-separated triple "x y z" into a Vector3.
-fn parse_vec3(s: &str) -> Vector3<f64> {
-    let vals: Vec<f64> = s.split_whitespace().filter_map(|v| v.parse().ok()).collect();
-    if vals.len() >= 3 {
-        Vector3::new(vals[0], vals[1], vals[2])
-    } else {
-        Vector3::zeros()
-    }
-}
-
-/// Parse an SDF `<geometry>` child element into a `GeometryShape`.
-fn parse_sdf_geometry(parent: &roxmltree::Node) -> Option<GeometryShape> {
-    let geom_el = parent.children().find(|n| n.tag_name().name() == "geometry")?;
-
-    for child in geom_el.children() {
-        match child.tag_name().name() {
-            "box" => {
-                let size_str = child_text(&child, "size").unwrap_or_default();
-                let size = parse_vec3(&size_str);
-                return Some(GeometryShape::Box {
-                    x: size[0],
-                    y: size[1],
-                    z: size[2],
-                });
-            }
-            "sphere" => {
-                let r = child_text(&child, "radius")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                return Some(GeometryShape::Sphere { radius: r });
-            }
-            "cylinder" => {
-                let r = child_text(&child, "radius")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let l = child_text(&child, "length")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                return Some(GeometryShape::Cylinder { radius: r, length: l });
-            }
-            "capsule" => {
-                let r = child_text(&child, "radius")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let l = child_text(&child, "length")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                return Some(GeometryShape::Capsule { radius: r, length: l });
-            }
-            "mesh" => {
-                let filename = child_text(&child, "uri").unwrap_or_default();
-                let scale = child_text(&child, "scale")
-                    .map(|s| parse_vec3(&s))
-                    .unwrap_or_else(|| Vector3::new(1.0, 1.0, 1.0));
-                return Some(GeometryShape::Mesh { filename, scale });
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Extract mesh_path / mesh_scale from a shape (convenience for GeometryObject).
-fn extract_mesh_info(shape: &GeometryShape) -> (Option<String>, Option<Vector3<f64>>) {
-    match shape {
-        GeometryShape::Mesh { filename, scale } => {
-            (Some(filename.clone()), Some(scale.clone()))
-        }
-        _ => (None, None),
+        SdfError::Topology(e)
     }
 }
 
@@ -962,10 +601,12 @@ mod tests {
         assert_eq!(vis.objects[1].parent_joint, 1);
         assert_eq!(vis.objects[2].parent_joint, 1);
 
-        // Check names from SDF attributes
-        assert_eq!(vis.objects[0].name, "vis_box");
-        assert_eq!(vis.objects[1].name, "vis_cyl");
-        assert_eq!(col.objects[0].name, "col_box");
+        // Unified pipeline: objects use the native `<link>_visual_<i>`
+        // naming — SDF `name` attributes are not part of the `.misa`
+        // schema, so they are not preserved.
+        assert_eq!(vis.objects[0].name, "base_visual_0");
+        assert_eq!(vis.objects[1].name, "child_visual_0");
+        assert_eq!(col.objects[0].name, "base_collision_0");
     }
 
     #[test]
@@ -1004,7 +645,8 @@ mod tests {
         assert_eq!(vis.num_objects(), 1);
         match &vis.objects[0].shape {
             GeometryShape::Mesh { filename, scale } => {
-                assert_eq!(filename, "model://robot/meshes/base.dae");
+                // `model://` URIs are normalised to SDF-relative paths.
+                assert_eq!(filename, "robot/meshes/base.dae");
                 assert_relative_eq!(*scale, Vector3::new(0.001, 0.001, 0.001), epsilon = 1e-12);
             }
             _ => panic!("expected mesh shape"),
@@ -1117,10 +759,10 @@ pub fn import_str(xml: &str) -> Result<SdfImport, String> {
             "fixed" => mn::JointKind::Fixed,
             "floating" => mn::JointKind::Floating,
             "planar" => mn::JointKind::Planar,
-            "ball" => {
+            "ball" | "universal" => {
                 warnings.push(format!(
-                    "joint '{name}': ball joint approximated as 'floating' \
-                     (.misa schema has no spherical kind)"
+                    "joint '{name}': {jtype} joint approximated as 'floating' \
+                     (.misa schema has no spherical / universal kind)"
                 ));
                 mn::JointKind::Floating
             }
