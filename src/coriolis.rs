@@ -377,8 +377,8 @@ mod tests {
 
         // v^T N v should be zero
         let vv = DVector::from_column_slice(&v);
-        let vtNv = vv.dot(&(&n_mat * &vv));
-        assert!(vtNv.abs() < 1e-5, "v^T (Ṁ-2C) v = {} (should be ~0)", vtNv);
+        let vt_nv = vv.dot(&(&n_mat * &vv));
+        assert!(vt_nv.abs() < 1e-5, "v^T (Ṁ-2C) v = {} (should be ~0)", vt_nv);
     }
 
     /// Skew-symmetry for 3-link
@@ -403,8 +403,8 @@ mod tests {
         let n_mat = &m_dot - 2.0 * &c;
 
         let vv = DVector::from_column_slice(&v);
-        let vtNv = vv.dot(&(&n_mat * &vv));
-        assert!(vtNv.abs() < 1e-5, "v^T (Ṁ-2C) v = {} (should be ~0)", vtNv);
+        let vt_nv = vv.dot(&(&n_mat * &vv));
+        assert!(vt_nv.abs() < 1e-5, "v^T (Ṁ-2C) v = {} (should be ~0)", vt_nv);
     }
 
     /// C should be zero when v is zero

@@ -387,7 +387,7 @@ mod tests {
         let q0 = Point3::new(0.0, 2.0, 0.0);
         let q1 = Point3::new(1.0, 2.0, 0.0);
 
-        let (pt1, pt2, dist) = closest_points_between_segments(&p0, &p1, &q0, &q1);
+        let (_pt1, _pt2, dist) = closest_points_between_segments(&p0, &p1, &q0, &q1);
         // Parallel segments 2 units apart
         assert_relative_eq!(dist, 2.0, epsilon = 1e-10);
     }

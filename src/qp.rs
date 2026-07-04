@@ -590,7 +590,6 @@ fn solve_qp_clarabel(
     b_iq: Option<&DVector<f64>>,
     config: &QpConfig,
 ) -> QpSolution {
-    use clarabel::algebra::CscMatrix;
     use clarabel::solver::{
         DefaultSettings, DefaultSettingsBuilder, DefaultSolver, IPSolver,
         SolverStatus, SupportedConeT,

@@ -90,7 +90,7 @@ mod tests {
     use crate::model::{LinkInertia, Model, ModelBuilder};
     use crate::se3;
     use approx::assert_relative_eq;
-    use nalgebra::{DVector, Matrix3, Vector3};
+    use nalgebra::{Matrix3, Vector3};
 
     fn two_link_arm() -> Model<f64> {
         let offset1 = se3::from_rotation_and_translation(
