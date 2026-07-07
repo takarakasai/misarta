@@ -30,13 +30,14 @@
 //! # Loading meshes via [`AssetSource`](misarta::native::AssetSource)
 //!
 //! [`load_urdf_geometry_string`] populates each `GeometryObject` with
-//! its `mesh_path` and leaves `mesh_data` empty. Mesh references are
-//! normalised to URDF-directory-relative paths at parse time
-//! (`package://pkg/rel` → `../rel` for the conventional
-//! `<pkg>/urdf/robot.urdf` layout, `file:///abs` → `/abs`), matching
-//! the `.misa` convention of "relative to the model file".
-//! [`misarta::native::load_meshes`] resolves them through any
-//! [`AssetSource`](misarta::native::AssetSource).
+//! its `mesh_path` (verbatim from the URDF, often
+//! `package://<pkg>/sub/foo.stl`) and leaves `mesh_data` empty.
+//! [`misarta::native::load_meshes`] handles those references through any
+//! [`AssetSource`](misarta::native::AssetSource) — `package://` and
+//! `file://` prefixes are stripped automatically by
+//! [`misarta::native::normalise_mesh_reference`]. Hosts that need
+//! layout-aware `package://` anchoring (ROS `<pkg>/urdf/` vs
+//! direct-in-package) resolve the verbatim URI themselves.
 //!
 //! ```no_run
 //! use misarta_formats::urdf;
@@ -116,8 +117,7 @@ pub fn load_urdf_geometry(
 /// dedicated loader: geometry objects follow the native
 /// `<link>_visual_<i>` / `<link>_collision_<i>` naming (URDF `name`
 /// attributes on `<visual>` are not part of the `.misa` schema), and
-/// mesh `filename`s are normalised to URDF-directory-relative paths
-/// (`package://pkg/rel` → `../rel`, `file:///abs` → `/abs`).
+/// mesh `filename`s are carried verbatim into `mesh_path` (as before).
 pub fn load_urdf_geometry_string(
     xml: &str,
 ) -> Result<(Model<f64>, GeometryModel, GeometryModel), UrdfError> {
@@ -163,11 +163,11 @@ pub fn import(path: &Path) -> Result<UrdfImport, String> {
 
 /// Parse URDF XML text into a [`MisaFile`].
 ///
-/// Mesh `filename`s are normalised to URDF-directory-relative paths so
-/// the `.misa` base-directory resolution rule finds the same files the
-/// classic `package://` resolver did (see module docs). `<limit>`,
-/// `<dynamics>`, `<mimic>` and materials are captured into the schema;
-/// the runtime `Model` ignores limits but hosts round-trip them.
+/// Mesh `filename`s are kept verbatim (`package://` included — see the
+/// module docs for why layout-aware anchoring is the host's job).
+/// `<limit>`, `<dynamics>`, `<mimic>` and materials are captured into
+/// the schema; the runtime `Model` ignores limits but hosts round-trip
+/// them.
 pub fn import_str(xml: &str) -> Result<UrdfImport, String> {
     let doc = Document::parse(xml).map_err(|e| format!("Parse URDF XML: {e}"))?;
     let robot = doc.root_element();
@@ -452,8 +452,14 @@ fn parse_geometry(parent: &roxmltree::Node) -> Option<mn::Geom> {
                 });
             }
             "mesh" => {
+                // The filename is kept verbatim (package:// included):
+                // the correct on-disk anchor for package:// depends on
+                // the package layout (`<pkg>/urdf/x.urdf` vs
+                // `<pkg>/x.urdf`), which only a filesystem-probing host
+                // can decide. misarta-side consumers resolve through
+                // `native::normalise_mesh_reference` + an `AssetSource`.
                 return Some(mn::Geom::Mesh {
-                    file: normalise_mesh_uri(child.attribute("filename").unwrap_or("")),
+                    file: child.attribute("filename").unwrap_or("").to_string(),
                     scale: child
                         .attribute("scale")
                         .map(|s| parse_vec3_or(s, [1.0, 1.0, 1.0]))
@@ -464,24 +470,6 @@ fn parse_geometry(parent: &roxmltree::Node) -> Option<mn::Geom> {
         }
     }
     None
-}
-
-/// Normalise a URDF mesh reference to a URDF-directory-relative path,
-/// matching the `.misa` convention of "relative to the model file":
-/// `package://pkg/rel` → `../rel` (the conventional
-/// `<pkg>/urdf/robot.urdf` layout puts the package root one level up),
-/// `file:///abs` → `/abs`, anything else verbatim.
-fn normalise_mesh_uri(uri: &str) -> String {
-    if let Some(rest) = uri.strip_prefix("package://") {
-        match rest.find('/') {
-            Some(i) => format!("../{}", &rest[i + 1..]),
-            None => "..".to_string(),
-        }
-    } else if let Some(rest) = uri.strip_prefix("file://") {
-        rest.to_string()
-    } else {
-        uri.to_string()
-    }
 }
 
 /// Extract an RGBA colour from a `<material>` element's `<color rgba>`.
@@ -1032,18 +1020,16 @@ mod tests {
 </robot>"#;
         let (_, vis, _) = load_urdf_geometry_string(xml).unwrap();
         assert_eq!(vis.num_objects(), 1);
-        // package://robot/... is normalised to a URDF-directory-relative
-        // path (package root = one level above the urdf/ dir).
         match &vis.objects[0].shape {
             GeometryShape::Mesh { filename, scale } => {
-                assert_eq!(filename, "../meshes/base.stl");
+                assert_eq!(filename, "package://robot/meshes/base.stl");
                 assert_relative_eq!(*scale, Vector3::new(0.001, 0.001, 0.001), epsilon = 1e-12);
             }
             _ => panic!("expected mesh shape"),
         }
         assert_eq!(
             vis.objects[0].mesh_path.as_deref(),
-            Some("../meshes/base.stl")
+            Some("package://robot/meshes/base.stl")
         );
     }
 
