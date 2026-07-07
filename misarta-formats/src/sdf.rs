@@ -5,22 +5,13 @@
 //! misarta who don't depend on articara — e.g. headless analysis tools,
 //! research code, or alternative front-ends.
 //!
-//! # Layering vs `articara::sdf`
+//! # Layering
 //!
-//! There are intentionally two SDF parsers in this workspace:
-//!
-//! | Crate | Output | Adds |
-//! |---|---|---|
-//! | `misarta::sdf` (this module) | `Model<f64>` + `GeometryModel × 2` | — (kinematics + plain geometry only) |
-//! | `articara::sdf` | `articara::RobotModel` | sensors, mimic, articara-side material handling, `.misarta.toml` sidecar integration, named pose state |
-//!
-//! articara does NOT delegate to this loader — the two parse paths
-//! evolve in parallel. This is acceptable because misarta-side is a
-//! strict subset (kinematics + plain geometry); upstream-side bug fixes
-//! that touch only structural parsing should be applied to both.
-//! Full deduplication is tracked in `articara/doc/refactor_20260502.md`
-//! §9.1 as a future refactor (cost: significant; risk: regression in
-//! either consumer).
+//! The single SDF parser is [`import_str`] (SDF → [`MisaFile`]); both
+//! this module's `Model` loaders and articara's `RobotModel` import go
+//! through it, so structural parsing has exactly one implementation
+//! (the historical dual-parser setup was unified in A5, see articara
+//! `doc/refactor_20260702.md` §4.7).
 //!
 //! # Supported elements
 //!

@@ -1,12 +1,21 @@
-//! URDF (Unified Robot Description Format) loader.
+//! URDF (Unified Robot Description Format) ⇄ [`MisaFile`] conversion and
+//! `Model<f64>` loader.
 //!
-//! Parses a URDF XML string and builds a `Model<f64>` using `ModelBuilder`.
+//! The single URDF parser lives in [`import_str`], which converts URDF
+//! XML into the `.misa` master schema ([`MisaFile`]). The classic loader
+//! API ([`load_urdf_string`] / [`load_urdf_geometry_string`]) is a thin
+//! wrapper over `import_str` + [`misarta::native::build_model`] — the
+//! same pipeline MJCF and SDF use, so every robot-description format
+//! enters through one MisaFile door.
 //!
 //! # Supported elements
 //!
-//! - `<robot>` — top-level container
-//! - `<link>` — rigid body with optional `<inertial>`
-//! - `<joint>` — revolute, prismatic, continuous, fixed, floating
+//! - `<robot>` — top-level container (plus top-level `<material>`)
+//! - `<link>` — rigid body with optional `<inertial>`, `<visual>`,
+//!   `<collision>` (box / cylinder / sphere / capsule / mesh)
+//! - `<joint>` — revolute, continuous, prismatic, fixed, floating,
+//!   planar; `<limit>`, `<dynamics>`, `<mimic>` are captured into the
+//!   schema
 //! - `<origin xyz="..." rpy="..."/>` — placement
 //! - `<axis xyz="..."/>` — joint axis
 //!
@@ -21,12 +30,13 @@
 //! # Loading meshes via [`AssetSource`](misarta::native::AssetSource)
 //!
 //! [`load_urdf_geometry_string`] populates each `GeometryObject` with
-//! its `mesh_path` (verbatim from the URDF, often
-//! `package://<pkg>/sub/foo.stl`) and leaves `mesh_data` empty.
-//! [`misarta::native::load_meshes`] handles those references through any
-//! [`AssetSource`](misarta::native::AssetSource) — `package://` and
-//! `file://` prefixes are stripped automatically by
-//! [`misarta::native::normalise_mesh_reference`].
+//! its `mesh_path` and leaves `mesh_data` empty. Mesh references are
+//! normalised to URDF-directory-relative paths at parse time
+//! (`package://pkg/rel` → `../rel` for the conventional
+//! `<pkg>/urdf/robot.urdf` layout, `file:///abs` → `/abs`), matching
+//! the `.misa` convention of "relative to the model file".
+//! [`misarta::native::load_meshes`] resolves them through any
+//! [`AssetSource`](misarta::native::AssetSource).
 //!
 //! ```no_run
 //! use misarta_formats::urdf;
@@ -35,19 +45,23 @@
 //! let (model, mut visual, mut collision) =
 //!     urdf::load_urdf_geometry_string(&xml).unwrap();
 //!
-//! // Resolve mesh files relative to the URDF's package root.
-//! let assets = native::FileSystemSource::new("path/to/package_root");
+//! // Resolve mesh files relative to the URDF's own directory.
+//! let assets = native::FileSystemSource::new("path/to/package_root/urdf");
 //! let _vrep = native::load_meshes(&mut visual, &assets).unwrap();
 //! let _crep = native::load_meshes(&mut collision, &assets).unwrap();
 //! ```
 
-use misarta::geometry::{GeometryModel, GeometryObject, GeometryShape};
-use misarta::joint::JointType;
-use misarta::model::{LinkInertia, Model, ModelBuilder};
+use std::path::Path;
+
+use misarta::geometry::{GeometryModel, GeometryShape};
+use misarta::model::Model;
+use misarta::native as mn;
+use misarta::native::MisaFile;
 use misarta::se3;
-use nalgebra::{Matrix3, Rotation3, Vector3};
+use nalgebra::Rotation3;
 use roxmltree::Document;
-use std::collections::HashMap;
+
+use crate::util::parse_vec3_or;
 
 /// Errors arising from URDF parsing.
 #[derive(Debug, Clone)]
@@ -94,414 +108,357 @@ pub fn load_urdf_geometry(
 
 /// Load a `Model<f64>` together with visual and collision `GeometryModel`s
 /// from a URDF XML string.
+///
+/// Thin wrapper over the `.misa` conversion pipeline: the URDF is first
+/// converted to a [`MisaFile`] via [`import_str`], then realised with
+/// [`misarta::native::build_model`] — the same path the hosts use, so
+/// the tree has exactly one URDF parser. Two consequences vs. the old
+/// dedicated loader: geometry objects follow the native
+/// `<link>_visual_<i>` / `<link>_collision_<i>` naming (URDF `name`
+/// attributes on `<visual>` are not part of the `.misa` schema), and
+/// mesh `filename`s are normalised to URDF-directory-relative paths
+/// (`package://pkg/rel` → `../rel`, `file:///abs` → `/abs`).
 pub fn load_urdf_geometry_string(
     xml: &str,
 ) -> Result<(Model<f64>, GeometryModel, GeometryModel), UrdfError> {
-    let doc = Document::parse(xml).map_err(|e| UrdfError::XmlParse(e.to_string()))?;
-    let robot = doc.root_element();
-    if robot.tag_name().name() != "robot" {
-        return Err(UrdfError::MissingElement("root <robot> element".into()));
-    }
-
-    // Build kinematic model via the existing parser (re-parse is cheap)
-    let model = load_urdf_string(xml)?;
-
-    // Build link_name → joint index map from the model
-    let mut link_to_idx: HashMap<&str, usize> = HashMap::new();
-    for (i, name) in model.link_names.iter().enumerate() {
-        link_to_idx.insert(name.as_str(), i);
-    }
-
-    let mut visual_model = GeometryModel::new();
-    let mut collision_model = GeometryModel::new();
-
-    for link_el in robot.children().filter(|n| n.tag_name().name() == "link") {
-        let link_name = link_el
-            .attribute("name")
-            .ok_or_else(|| UrdfError::MissingElement("link name".into()))?;
-        let joint_idx = *link_to_idx
-            .get(link_name)
-            .ok_or_else(|| UrdfError::Topology(format!("link '{link_name}' not in model")))?;
-
-        // Visual geometries
-        for (vi, vis_el) in link_el
-            .children()
-            .filter(|n| n.tag_name().name() == "visual")
-            .enumerate()
-        {
-            let placement = parse_origin_element(&vis_el);
-            if let Some(shape) = parse_urdf_geometry(&vis_el) {
-                let obj_name = vis_el
-                    .attribute("name")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{link_name}_visual_{vi}"));
-                let (mesh_path, mesh_scale) = extract_mesh_info(&shape);
-                visual_model.add(GeometryObject {
-                    name: obj_name,
-                    parent_joint: joint_idx,
-                    placement,
-                    shape,
-                    mesh_path,
-                    mesh_scale,
-                    mesh_data: None,
-            material: None,
-                });
-            }
-        }
-
-        // Collision geometries
-        for (ci, col_el) in link_el
-            .children()
-            .filter(|n| n.tag_name().name() == "collision")
-            .enumerate()
-        {
-            let placement = parse_origin_element(&col_el);
-            if let Some(shape) = parse_urdf_geometry(&col_el) {
-                let obj_name = col_el
-                    .attribute("name")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{link_name}_collision_{ci}"));
-                let (mesh_path, mesh_scale) = extract_mesh_info(&shape);
-                collision_model.add(GeometryObject {
-                    name: obj_name,
-                    parent_joint: joint_idx,
-                    placement,
-                    shape,
-                    mesh_path,
-                    mesh_scale,
-                    mesh_data: None,
-            material: None,
-                });
-            }
-        }
-    }
-
-    Ok((model, visual_model, collision_model))
+    let import = import_str(xml).map_err(import_err_to_urdf)?;
+    misarta::native::build_model(&import.file)
+        .map_err(|e| UrdfError::Topology(e.to_string()))
 }
 
-/// Load a `Model<f64>` from a URDF XML string.
+/// Load a `Model<f64>` from a URDF XML string. See
+/// [`load_urdf_geometry_string`] for the conversion pipeline.
 pub fn load_urdf_string(xml: &str) -> Result<Model<f64>, UrdfError> {
-    let doc = Document::parse(xml).map_err(|e| UrdfError::XmlParse(e.to_string()))?;
-    let robot = doc
-        .root_element();
+    Ok(load_urdf_geometry_string(xml)?.0)
+}
+
+/// Map an [`import_str`] error string onto the closest [`UrdfError`]
+/// variant so the loader API keeps its typed errors.
+fn import_err_to_urdf(e: String) -> UrdfError {
+    if let Some(msg) = e.strip_prefix("Parse URDF XML: ") {
+        UrdfError::XmlParse(msg.to_string())
+    } else if e.starts_with("No <robot>") {
+        UrdfError::MissingElement("root <robot> element".into())
+    } else {
+        UrdfError::Topology(e)
+    }
+}
+
+// ═════════════════════════ MisaFile conversion ══════════════════════════
+
+/// Result of a successful URDF import: the converted [`MisaFile`] plus
+/// non-fatal conversion notes (degraded joint kinds, dropped extras).
+/// Hosts should surface the warnings to the user.
+#[derive(Debug, Clone)]
+pub struct UrdfImport {
+    pub file: MisaFile,
+    pub warnings: Vec<String>,
+}
+
+/// Parse a URDF file on disk into a [`MisaFile`].
+pub fn import(path: &Path) -> Result<UrdfImport, String> {
+    let xml = std::fs::read_to_string(path).map_err(|e| format!("Read URDF: {e}"))?;
+    import_str(&xml)
+}
+
+/// Parse URDF XML text into a [`MisaFile`].
+///
+/// Mesh `filename`s are normalised to URDF-directory-relative paths so
+/// the `.misa` base-directory resolution rule finds the same files the
+/// classic `package://` resolver did (see module docs). `<limit>`,
+/// `<dynamics>`, `<mimic>` and materials are captured into the schema;
+/// the runtime `Model` ignores limits but hosts round-trip them.
+pub fn import_str(xml: &str) -> Result<UrdfImport, String> {
+    let doc = Document::parse(xml).map_err(|e| format!("Parse URDF XML: {e}"))?;
+    let robot = doc.root_element();
     if robot.tag_name().name() != "robot" {
-        return Err(UrdfError::MissingElement("root <robot> element".into()));
+        return Err("No <robot> root element found in URDF".into());
     }
 
-    // ── Collect links ───────────────────────────────────────────────────
-    // Map link_name → LinkInertia
-    let mut link_inertias: HashMap<String, LinkInertia<f64>> = HashMap::new();
+    let mut file = MisaFile::new(robot.attribute("name").unwrap_or(""), "");
+    let mut warnings: Vec<String> = Vec::new();
+
+    // ── Top-level materials ─────────────────────────────────────────────
+    // `<material name="x"><color rgba="..."/></material>` becomes a
+    // named [[material]] entry; visuals reference it by name.
+    for mat_el in robot
+        .children()
+        .filter(|n| n.tag_name().name() == "material")
+    {
+        let Some(name) = mat_el.attribute("name") else {
+            continue;
+        };
+        if let Some(rgba) = material_rgba(&mat_el) {
+            file.material.push(mn::Material {
+                name: name.to_string(),
+                color: mn::ColorSpec::Rgba(rgba),
+            });
+        }
+    }
+
+    // ── Links ───────────────────────────────────────────────────────────
     for link_el in robot.children().filter(|n| n.tag_name().name() == "link") {
         let name = link_el
             .attribute("name")
-            .ok_or_else(|| UrdfError::MissingElement("link name".into()))?
-            .to_string();
-        let inertia = parse_link_inertia(&link_el);
-        link_inertias.insert(name, inertia);
-    }
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("link_{}", file.link.len()));
 
-    // ── Collect joints ──────────────────────────────────────────────────
-    struct JointInfo {
-        name: String,
-        joint_type: JointType<f64>,
-        parent_link: String,
-        child_link: String,
-        origin: nalgebra::Isometry3<f64>,
-        /// URDF `<mimic joint="..." multiplier="..." offset="..."/>`
-        mimic: Option<(String, f64, f64)>,
-    }
-
-    let mut joints: Vec<JointInfo> = Vec::new();
-    for joint_el in robot.children().filter(|n| n.tag_name().name() == "joint") {
-        let name = joint_el
-            .attribute("name")
-            .ok_or_else(|| UrdfError::MissingElement("joint name".into()))?
-            .to_string();
-        let jtype_str = joint_el
-            .attribute("type")
-            .ok_or_else(|| UrdfError::MissingElement(format!("joint type for '{name}'")))?;
-
-        let parent_link = joint_el
+        let visual: Vec<mn::Visual> = link_el
             .children()
-            .find(|n| n.tag_name().name() == "parent")
-            .and_then(|n| n.attribute("link"))
-            .ok_or_else(|| UrdfError::MissingElement(format!("parent link for '{name}'")))?
-            .to_string();
+            .filter(|n| n.tag_name().name() == "visual")
+            .filter_map(|v| {
+                let (color, material) = visual_color_or_material(&v);
+                Some(mn::Visual {
+                    origin: parse_origin(&v),
+                    geom: parse_geometry(&v)?,
+                    color,
+                    material,
+                })
+            })
+            .collect();
 
-        let child_link = joint_el
+        let collision: Vec<mn::Collision> = link_el
             .children()
-            .find(|n| n.tag_name().name() == "child")
-            .and_then(|n| n.attribute("link"))
-            .ok_or_else(|| UrdfError::MissingElement(format!("child link for '{name}'")))?
-            .to_string();
+            .filter(|n| n.tag_name().name() == "collision")
+            .filter_map(|c| {
+                Some(mn::Collision {
+                    origin: parse_origin(&c),
+                    geom: parse_geometry(&c)?,
+                    physics: None,
+                })
+            })
+            .collect();
 
-        let origin = parse_origin_element(&joint_el);
-
-        let axis = parse_axis_element(&joint_el);
-
-        let joint_type = match jtype_str {
-            "revolute" | "continuous" => JointType::Revolute { axis },
-            "prismatic" => JointType::Prismatic { axis },
-            "fixed" => JointType::Fixed,
-            "floating" => JointType::FreeFlyer,
-            other => return Err(UrdfError::UnsupportedJointType(other.to_string())),
-        };
-
-        // Parse optional <mimic joint="..." multiplier="..." offset="..."/>
-        let mimic = joint_el
-            .children()
-            .find(|n| n.tag_name().name() == "mimic")
-            .map(|mimic_el| {
-                let master_name = mimic_el
-                    .attribute("joint")
-                    .unwrap_or("")
-                    .to_string();
-                let multiplier: f64 = mimic_el
-                    .attribute("multiplier")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1.0);
-                let offset: f64 = mimic_el
-                    .attribute("offset")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
-                (master_name, multiplier, offset)
-            });
-
-        joints.push(JointInfo {
+        file.link.push(mn::Link {
             name,
-            joint_type,
-            parent_link,
-            child_link,
-            origin,
-            mimic,
+            description: String::new(),
+            inertial: parse_inertial(&link_el),
+            visual,
+            collision,
+            collision_enabled: true,
         });
     }
 
-    // ── Find root link (not a child of any joint) ───────────────────────
-    let child_links: std::collections::HashSet<&str> =
-        joints.iter().map(|j| j.child_link.as_str()).collect();
-    let root_link = link_inertias
-        .keys()
-        .find(|name| !child_links.contains(name.as_str()))
-        .ok_or_else(|| UrdfError::Topology("no root link found".into()))?
-        .clone();
+    // ── Joints ──────────────────────────────────────────────────────────
+    let mut child_links: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for joint_el in robot.children().filter(|n| n.tag_name().name() == "joint") {
+        let name = joint_el
+            .attribute("name")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("joint_{}", file.joint.len()));
 
-    // ── Build model via topological traversal ───────────────────────────
-    // link_name → model joint index
-    let mut link_to_idx: HashMap<String, usize> = HashMap::new();
-    link_to_idx.insert(root_link.clone(), 0); // root link ↔ universe joint
+        let jtype = joint_el.attribute("type").unwrap_or_else(|| {
+            warnings.push(format!("joint '{name}': missing type, treating as 'fixed'"));
+            "fixed"
+        });
+        let kind = match jtype {
+            "revolute" => mn::JointKind::Revolute,
+            "continuous" => mn::JointKind::Continuous,
+            "prismatic" => mn::JointKind::Prismatic,
+            "fixed" => mn::JointKind::Fixed,
+            "floating" => mn::JointKind::Floating,
+            "planar" => mn::JointKind::Planar,
+            other => {
+                warnings.push(format!(
+                    "joint '{name}': unsupported URDF joint type '{other}', \
+                     treating as 'fixed'"
+                ));
+                mn::JointKind::Fixed
+            }
+        };
 
-    // BFS / topological order
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back(root_link.clone());
-    let mut ordered_joints: Vec<&JointInfo> = Vec::new();
+        let parent = joint_el
+            .children()
+            .find(|n| n.tag_name().name() == "parent")
+            .and_then(|n| n.attribute("link"))
+            .unwrap_or("world")
+            .to_string();
+        let child = joint_el
+            .children()
+            .find(|n| n.tag_name().name() == "child")
+            .and_then(|n| n.attribute("link"))
+            .unwrap_or("link")
+            .to_string();
+        child_links.insert(child.clone());
 
-    while let Some(parent_name) = queue.pop_front() {
-        for ji in &joints {
-            if ji.parent_link == parent_name && !link_to_idx.contains_key(&ji.child_link) {
-                ordered_joints.push(ji);
-                // Reserve an index for this child link
-                let idx = link_to_idx.len();
-                link_to_idx.insert(ji.child_link.clone(), idx);
-                queue.push_back(ji.child_link.clone());
+        let axis = joint_el
+            .children()
+            .find(|n| n.tag_name().name() == "axis")
+            .and_then(|n| n.attribute("xyz"))
+            .map(|s| parse_vec3_or(s, [0.0, 0.0, 1.0]))
+            .unwrap_or([0.0, 0.0, 1.0]);
+
+        let limit = joint_el
+            .children()
+            .find(|n| n.tag_name().name() == "limit")
+            .map(|l| mn::JointLimit {
+                lower: attr_f64(&l, "lower"),
+                upper: attr_f64(&l, "upper"),
+                effort: attr_f64(&l, "effort"),
+                velocity: attr_f64(&l, "velocity"),
+            })
+            .unwrap_or_default();
+
+        let dynamics = joint_el
+            .children()
+            .find(|n| n.tag_name().name() == "dynamics")
+            .map(|d| mn::JointDynamics {
+                armature: 0.0,
+                damping: attr_f64(&d, "damping"),
+                friction: attr_f64(&d, "friction"),
+            })
+            .unwrap_or_default();
+
+        // `<mimic joint="..." multiplier="..." offset="..."/>`
+        if let Some(mimic_el) = joint_el
+            .children()
+            .find(|n| n.tag_name().name() == "mimic")
+        {
+            if let Some(source) = mimic_el.attribute("joint") {
+                file.mimic.push(mn::Mimic {
+                    joint: name.clone(),
+                    source: source.to_string(),
+                    multiplier: mimic_el
+                        .attribute("multiplier")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1.0),
+                    offset: mimic_el
+                        .attribute("offset")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0),
+                });
             }
         }
+
+        file.joint.push(mn::Joint {
+            name,
+            kind,
+            parent,
+            child,
+            axis,
+            origin: parse_origin(&joint_el),
+            limit,
+            dynamics,
+        });
     }
 
-    // Check all joints were visited
-    if ordered_joints.len() != joints.len() {
-        return Err(UrdfError::Topology(
-            "some joints could not be reached from root link".into(),
-        ));
-    }
-
-    let robot_name = robot.attribute("name").unwrap_or("").to_string();
-    let mut builder = ModelBuilder::new()
-        .name(robot_name)
-        .root_link_name(root_link.clone());
-    for ji in &ordered_joints {
-        let parent_idx = link_to_idx[&ji.parent_link];
-        let inertia = link_inertias
-            .get(&ji.child_link)
-            .cloned()
-            .unwrap_or_else(LinkInertia::zero);
-
-        builder = builder.add_joint_with_link(
-            ji.name.clone(),
-            parent_idx,
-            ji.joint_type.clone(),
-            ji.origin,
-            inertia,
-            ji.child_link.clone(),
-        );
-    }
-
-    // ── Apply mimic constraints ─────────────────────────────────────────
-    // We need to resolve master joint names to model indices.
-    // Build joint_name → model index map.
-    let model_tmp = builder.build();
-    let joint_name_to_idx: HashMap<&str, usize> = model_tmp
-        .joints
+    // ── Root link = not a child of any joint ────────────────────────────
+    file.robot.root = file
+        .link
         .iter()
-        .enumerate()
-        .map(|(i, j)| (j.name.as_str(), i))
-        .collect();
+        .find(|l| !child_links.contains(&l.name))
+        .map(|l| l.name.clone())
+        .ok_or("no root link found in URDF (every link is some joint's child)")?;
 
-    let mut builder2 = ModelBuilder::from_model(&model_tmp);
-    for ji in &ordered_joints {
-        if let Some((ref master_name, multiplier, offset)) = ji.mimic {
-            let slave_idx = *joint_name_to_idx.get(ji.name.as_str()).ok_or_else(|| {
-                UrdfError::Topology(format!("mimic slave joint '{}' not found", ji.name))
-            })?;
-            let master_idx = *joint_name_to_idx.get(master_name.as_str()).ok_or_else(|| {
-                UrdfError::Topology(format!(
-                    "mimic master joint '{}' (referenced by '{}') not found",
-                    master_name, ji.name
-                ))
-            })?;
-            builder2 = builder2.add_mimic(slave_idx, master_idx, multiplier, offset);
-        }
-    }
-
-    Ok(builder2.build())
+    Ok(UrdfImport { file, warnings })
 }
 
-// ─── Internal helpers ───────────────────────────────────────────────────────
+// ─── Import helpers ─────────────────────────────────────────────────────
 
-/// Parse an `<origin xyz="..." rpy="..."/>` beneath a parent node.
-fn parse_origin_element(parent: &roxmltree::Node) -> nalgebra::Isometry3<f64> {
-    if let Some(origin_el) = parent.children().find(|n| n.tag_name().name() == "origin") {
-        let xyz = parse_vec3(origin_el.attribute("xyz").unwrap_or("0 0 0"));
-        let rpy = parse_vec3(origin_el.attribute("rpy").unwrap_or("0 0 0"));
-        let rot = Rotation3::from_euler_angles(rpy[0], rpy[1], rpy[2]);
-        se3::from_rotation_and_translation(&rot, &xyz)
-    } else {
-        se3::identity()
-    }
+/// Parse an `<origin xyz="..." rpy="..."/>` beneath a parent node into
+/// an [`mn::Origin`].
+fn parse_origin(parent: &roxmltree::Node) -> mn::Origin {
+    let Some(origin_el) = parent.children().find(|n| n.tag_name().name() == "origin") else {
+        return mn::Origin::default();
+    };
+    let xyz = origin_el
+        .attribute("xyz")
+        .map(|s| parse_vec3_or(s, [0.0; 3]))
+        .unwrap_or([0.0; 3]);
+    let rpy = origin_el
+        .attribute("rpy")
+        .map(|s| parse_vec3_or(s, [0.0; 3]))
+        .filter(|r| r.iter().any(|v| *v != 0.0));
+    mn::Origin { xyz, rpy, quat: None }
 }
 
-/// Parse an `<axis xyz="..."/>` element, defaulting to Z.
-fn parse_axis_element(parent: &roxmltree::Node) -> Vector3<f64> {
-    if let Some(axis_el) = parent.children().find(|n| n.tag_name().name() == "axis") {
-        let v = parse_vec3(axis_el.attribute("xyz").unwrap_or("0 0 1"));
-        let n = v.norm();
-        if n > 1e-12 {
-            v / n
-        } else {
-            Vector3::z()
-        }
-    } else {
-        Vector3::z()
-    }
-}
-
-/// Parse `<inertial>` for a link.
-fn parse_link_inertia(link_el: &roxmltree::Node) -> LinkInertia<f64> {
-    if let Some(inertial) = link_el.children().find(|n| n.tag_name().name() == "inertial") {
-        let mass = inertial
-            .children()
-            .find(|n| n.tag_name().name() == "mass")
-            .and_then(|n| n.attribute("value"))
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-
-        let com = if let Some(origin) = inertial
-            .children()
-            .find(|n| n.tag_name().name() == "origin")
-        {
-            parse_vec3(origin.attribute("xyz").unwrap_or("0 0 0"))
-        } else {
-            Vector3::zeros()
-        };
-
-        let rotational_inertia = if let Some(inertia_el) = inertial
-            .children()
-            .find(|n| n.tag_name().name() == "inertia")
-        {
-            let ixx = inertia_el.attribute("ixx").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let ixy = inertia_el.attribute("ixy").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let ixz = inertia_el.attribute("ixz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let iyy = inertia_el.attribute("iyy").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let iyz = inertia_el.attribute("iyz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let izz = inertia_el.attribute("izz").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            Matrix3::new(ixx, ixy, ixz, ixy, iyy, iyz, ixz, iyz, izz)
-        } else {
-            Matrix3::zeros()
-        };
-
-        LinkInertia {
-            mass,
-            center_of_mass: com,
-            rotational_inertia,
-        }
-    } else {
-        LinkInertia::zero()
+/// Parse a link's `<inertial>` into an [`mn::Inertial`]. The inertial
+/// `<origin>` keeps both the COM translation and the principal-axis
+/// rotation (`rpy`) — `build_model` rotates the tensor into the link
+/// frame, which the old dedicated loader silently skipped.
+fn parse_inertial(link_el: &roxmltree::Node) -> mn::Inertial {
+    let Some(inertial) = link_el
+        .children()
+        .find(|n| n.tag_name().name() == "inertial")
+    else {
+        return mn::Inertial::default();
+    };
+    let mass = inertial
+        .children()
+        .find(|n| n.tag_name().name() == "mass")
+        .map(|m| attr_f64(&m, "value"))
+        .unwrap_or(0.0);
+    let (ixx, ixy, ixz, iyy, iyz, izz) = inertial
+        .children()
+        .find(|n| n.tag_name().name() == "inertia")
+        .map(|i| {
+            (
+                attr_f64(&i, "ixx"),
+                attr_f64(&i, "ixy"),
+                attr_f64(&i, "ixz"),
+                attr_f64(&i, "iyy"),
+                attr_f64(&i, "iyz"),
+                attr_f64(&i, "izz"),
+            )
+        })
+        .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+    mn::Inertial {
+        mass,
+        ixx,
+        iyy,
+        izz,
+        ixy,
+        ixz,
+        iyz,
+        origin: parse_origin(&inertial),
     }
 }
 
-/// Parse a whitespace-separated triple "x y z" into a Vector3.
-fn parse_vec3(s: &str) -> Vector3<f64> {
-    let vals: Vec<f64> = s.split_whitespace().filter_map(|v| v.parse().ok()).collect();
-    if vals.len() >= 3 {
-        Vector3::new(vals[0], vals[1], vals[2])
-    } else {
-        Vector3::zeros()
-    }
+fn attr_f64(node: &roxmltree::Node, attr: &str) -> f64 {
+    node.attribute(attr)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
 }
 
-/// Parse a URDF `<geometry>` child element into a `GeometryShape`.
-fn parse_urdf_geometry(parent: &roxmltree::Node) -> Option<GeometryShape> {
-    let geom_el = parent.children().find(|n| n.tag_name().name() == "geometry")?;
-
+/// Parse a URDF `<geometry>` child element. Returns `None` when the
+/// element is missing or contains no recognised shape (matching the old
+/// loader, which skipped such visuals).
+fn parse_geometry(parent: &roxmltree::Node) -> Option<mn::Geom> {
+    let geom_el = parent
+        .children()
+        .find(|n| n.tag_name().name() == "geometry")?;
     for child in geom_el.children() {
         match child.tag_name().name() {
             "box" => {
-                let size = parse_vec3(child.attribute("size").unwrap_or("0 0 0"));
-                return Some(GeometryShape::Box {
-                    x: size[0],
-                    y: size[1],
-                    z: size[2],
-                });
+                let size = parse_vec3_or(child.attribute("size").unwrap_or("0 0 0"), [0.0; 3]);
+                return Some(mn::Geom::Box { size });
             }
             "sphere" => {
-                let r = child
-                    .attribute("radius")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                return Some(GeometryShape::Sphere { radius: r });
+                return Some(mn::Geom::Sphere {
+                    radius: attr_f64(&child, "radius"),
+                });
             }
             "cylinder" => {
-                let r = child
-                    .attribute("radius")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let l = child
-                    .attribute("length")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                return Some(GeometryShape::Cylinder { radius: r, length: l });
+                return Some(mn::Geom::Cylinder {
+                    radius: attr_f64(&child, "radius"),
+                    length: attr_f64(&child, "length"),
+                });
             }
             "capsule" => {
-                let r = child
-                    .attribute("radius")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let l = child
-                    .attribute("length")
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                return Some(GeometryShape::Capsule { radius: r, length: l });
+                return Some(mn::Geom::Capsule {
+                    radius: attr_f64(&child, "radius"),
+                    length: attr_f64(&child, "length"),
+                });
             }
             "mesh" => {
-                let filename = child
-                    .attribute("filename")
-                    .unwrap_or("")
-                    .to_string();
-                let scale = child
-                    .attribute("scale")
-                    .map(|s| parse_vec3(s))
-                    .unwrap_or_else(|| Vector3::new(1.0, 1.0, 1.0));
-                return Some(GeometryShape::Mesh { filename, scale });
+                return Some(mn::Geom::Mesh {
+                    file: normalise_mesh_uri(child.attribute("filename").unwrap_or("")),
+                    scale: child
+                        .attribute("scale")
+                        .map(|s| parse_vec3_or(s, [1.0, 1.0, 1.0]))
+                        .unwrap_or([1.0, 1.0, 1.0]),
+                });
             }
             _ => {}
         }
@@ -509,14 +466,52 @@ fn parse_urdf_geometry(parent: &roxmltree::Node) -> Option<GeometryShape> {
     None
 }
 
-/// Extract mesh_path / mesh_scale from a shape (convenience for GeometryObject).
-fn extract_mesh_info(shape: &GeometryShape) -> (Option<String>, Option<Vector3<f64>>) {
-    match shape {
-        GeometryShape::Mesh { filename, scale } => {
-            (Some(filename.clone()), Some(scale.clone()))
+/// Normalise a URDF mesh reference to a URDF-directory-relative path,
+/// matching the `.misa` convention of "relative to the model file":
+/// `package://pkg/rel` → `../rel` (the conventional
+/// `<pkg>/urdf/robot.urdf` layout puts the package root one level up),
+/// `file:///abs` → `/abs`, anything else verbatim.
+fn normalise_mesh_uri(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("package://") {
+        match rest.find('/') {
+            Some(i) => format!("../{}", &rest[i + 1..]),
+            None => "..".to_string(),
         }
-        _ => (None, None),
+    } else if let Some(rest) = uri.strip_prefix("file://") {
+        rest.to_string()
+    } else {
+        uri.to_string()
     }
+}
+
+/// Extract an RGBA colour from a `<material>` element's `<color rgba>`.
+fn material_rgba(mat_el: &roxmltree::Node) -> Option<[f32; 4]> {
+    let color_el = mat_el.children().find(|n| n.tag_name().name() == "color")?;
+    let v: Vec<f32> = color_el
+        .attribute("rgba")?
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    Some([
+        v.first().copied().unwrap_or(0.8),
+        v.get(1).copied().unwrap_or(0.8),
+        v.get(2).copied().unwrap_or(0.8),
+        v.get(3).copied().unwrap_or(1.0),
+    ])
+}
+
+/// Resolve a `<visual>`'s material: an inline `<color>` wins, otherwise
+/// a named reference to a top-level `[[material]]`.
+fn visual_color_or_material(
+    vis_el: &roxmltree::Node,
+) -> (Option<mn::ColorSpec>, Option<String>) {
+    let Some(mat_el) = vis_el.children().find(|n| n.tag_name().name() == "material") else {
+        return (None, None);
+    };
+    if let Some(rgba) = material_rgba(&mat_el) {
+        return (Some(mn::ColorSpec::Rgba(rgba)), None);
+    }
+    (None, mat_el.attribute("name").map(str::to_string))
 }
 
 // ─── Writer ─────────────────────────────────────────────────────────────────
@@ -539,6 +534,8 @@ pub fn write_urdf_geometry_string(
     visual: Option<&GeometryModel>,
     collision: Option<&GeometryModel>,
 ) -> String {
+    use misarta::joint::JointType;
+
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\"?>\n");
     out.push_str(&format!("<robot name=\"{}\">\n", xml_escape(&model.name)));
@@ -644,7 +641,11 @@ pub fn write_urdf_geometry_string(
 }
 
 /// Write a `<visual>` or `<collision>` element for a geometry object.
-fn write_urdf_visual_or_collision(out: &mut String, obj: &GeometryObject, tag: &str) {
+fn write_urdf_visual_or_collision(
+    out: &mut String,
+    obj: &misarta::geometry::GeometryObject,
+    tag: &str,
+) {
     out.push_str(&format!("    <{tag}>\n"));
 
     // origin
@@ -710,6 +711,9 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use misarta::joint::JointType;
+    use misarta::model::{LinkInertia, ModelBuilder};
+    use nalgebra::Vector3;
 
     const SIMPLE_URDF: &str = r#"<?xml version="1.0"?>
 <robot name="simple">
@@ -853,6 +857,9 @@ mod tests {
             model.joints[1].joint_type,
             JointType::Revolute { .. }
         ));
+        // ...while the MisaFile keeps the distinct Continuous kind.
+        let import = import_str(xml).unwrap();
+        assert_eq!(import.file.joint[0].kind, mn::JointKind::Continuous);
     }
 
     #[test]
@@ -986,6 +993,10 @@ mod tests {
         assert_eq!(vis.objects[0].parent_joint, 0); // base
         assert_eq!(vis.objects[1].parent_joint, 1); // child
         assert_eq!(vis.objects[2].parent_joint, 1); // child
+
+        // Geometry objects follow the native naming convention.
+        assert_eq!(vis.objects[0].name, "base_visual_0");
+        assert_eq!(col.objects[0].name, "base_collision_0");
     }
 
     #[test]
@@ -1021,16 +1032,142 @@ mod tests {
 </robot>"#;
         let (_, vis, _) = load_urdf_geometry_string(xml).unwrap();
         assert_eq!(vis.num_objects(), 1);
+        // package://robot/... is normalised to a URDF-directory-relative
+        // path (package root = one level above the urdf/ dir).
         match &vis.objects[0].shape {
             GeometryShape::Mesh { filename, scale } => {
-                assert_eq!(filename, "package://robot/meshes/base.stl");
+                assert_eq!(filename, "../meshes/base.stl");
                 assert_relative_eq!(*scale, Vector3::new(0.001, 0.001, 0.001), epsilon = 1e-12);
             }
             _ => panic!("expected mesh shape"),
         }
         assert_eq!(
             vis.objects[0].mesh_path.as_deref(),
-            Some("package://robot/meshes/base.stl")
+            Some("../meshes/base.stl")
         );
+    }
+
+    // ─── MisaFile import ────────────────────────────────────────────────
+
+    #[test]
+    fn import_captures_limits_dynamics_and_materials() {
+        let xml = r#"<?xml version="1.0"?>
+<robot name="rich">
+  <material name="red"><color rgba="1 0 0 1"/></material>
+  <link name="base">
+    <visual>
+      <geometry><box size="0.1 0.1 0.1"/></geometry>
+      <material name="red"/>
+    </visual>
+    <visual>
+      <geometry><sphere radius="0.05"/></geometry>
+      <material name="inline"><color rgba="0 1 0 0.5"/></material>
+    </visual>
+  </link>
+  <link name="arm"/>
+  <joint name="shoulder" type="revolute">
+    <parent link="base"/>
+    <child link="arm"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="30" velocity="10"/>
+    <dynamics damping="0.2" friction="0.05"/>
+  </joint>
+</robot>"#;
+        let import = import_str(xml).unwrap();
+        let f = &import.file;
+        assert!(import.warnings.is_empty(), "{:?}", import.warnings);
+        assert_eq!(f.robot.root, "base");
+
+        assert_eq!(f.material.len(), 1);
+        assert_eq!(f.material[0].name, "red");
+        assert_eq!(f.link[0].visual[0].material.as_deref(), Some("red"));
+        assert!(f.link[0].visual[0].color.is_none());
+        assert!(matches!(
+            f.link[0].visual[1].color,
+            Some(mn::ColorSpec::Rgba(c)) if c == [0.0, 1.0, 0.0, 0.5]
+        ));
+
+        let j = &f.joint[0];
+        assert_eq!((j.limit.lower, j.limit.upper), (-1.5, 1.5));
+        assert_eq!((j.limit.effort, j.limit.velocity), (30.0, 10.0));
+        assert_eq!((j.dynamics.damping, j.dynamics.friction), (0.2, 0.05));
+    }
+
+    #[test]
+    fn import_captures_mimic() {
+        let xml = r#"<robot name="m">
+  <link name="a"/><link name="b"/><link name="c"/>
+  <joint name="j1" type="revolute">
+    <parent link="a"/><child link="b"/><axis xyz="0 0 1"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="a"/><child link="c"/><axis xyz="0 0 1"/>
+    <mimic joint="j1" multiplier="-2" offset="0.1"/>
+  </joint>
+</robot>"#;
+        let import = import_str(xml).unwrap();
+        assert_eq!(import.file.mimic.len(), 1);
+        let m = &import.file.mimic[0];
+        assert_eq!((m.joint.as_str(), m.source.as_str()), ("j2", "j1"));
+        assert_eq!((m.multiplier, m.offset), (-2.0, 0.1));
+        // ...and the built Model applies it.
+        let model = load_urdf_string(xml).unwrap();
+        assert_eq!(model.mimic.len(), 1);
+    }
+
+    #[test]
+    fn import_degrades_unknown_joint_type_with_warning() {
+        let xml = r#"<robot name="u">
+  <link name="a"/><link name="b"/>
+  <joint name="weird" type="gearbox">
+    <parent link="a"/><child link="b"/>
+  </joint>
+</robot>"#;
+        let import = import_str(xml).unwrap();
+        assert_eq!(import.file.joint[0].kind, mn::JointKind::Fixed);
+        assert_eq!(import.warnings.len(), 1);
+        assert!(import.warnings[0].contains("gearbox"));
+    }
+
+    #[test]
+    fn import_rejects_rootless_and_non_robot() {
+        // Cyclic (no root) URDF is an import error, mapped to Topology.
+        let cyclic = r#"<robot name="c">
+  <link name="a"/><link name="b"/>
+  <joint name="j1" type="fixed"><parent link="a"/><child link="b"/></joint>
+  <joint name="j2" type="fixed"><parent link="b"/><child link="a"/></joint>
+</robot>"#;
+        assert!(matches!(
+            load_urdf_string(cyclic),
+            Err(UrdfError::Topology(_))
+        ));
+        assert!(matches!(
+            load_urdf_string("<sdf version=\"1.7\"/>"),
+            Err(UrdfError::MissingElement(_))
+        ));
+    }
+
+    #[test]
+    fn import_inertial_rpy_rotates_tensor() {
+        // A 90° roll on the inertial frame swaps the yy / zz moments in
+        // the link frame (the old loader silently dropped the rotation).
+        // The inertial sits on a child link — root-link inertia is not
+        // representable in the joint-indexed Model (same as before).
+        let xml = r#"<robot name="i">
+  <link name="base"/>
+  <link name="a">
+    <inertial>
+      <mass value="1"/>
+      <origin xyz="0 0 0" rpy="1.5707963267948966 0 0"/>
+      <inertia ixx="1" ixy="0" ixz="0" iyy="2" iyz="0" izz="3"/>
+    </inertial>
+  </link>
+  <joint name="j" type="fixed"><parent link="base"/><child link="a"/></joint>
+</robot>"#;
+        let model = load_urdf_string(xml).unwrap();
+        let ri = &model.inertias[1].rotational_inertia;
+        assert_relative_eq!(ri[(0, 0)], 1.0, epsilon = 1e-9);
+        assert_relative_eq!(ri[(1, 1)], 3.0, epsilon = 1e-9);
+        assert_relative_eq!(ri[(2, 2)], 2.0, epsilon = 1e-9);
     }
 }
