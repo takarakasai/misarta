@@ -502,6 +502,290 @@ fn visual_color_or_material(
     (None, mat_el.attribute("name").map(str::to_string))
 }
 
+
+// ═════════════════════════ MisaFile export ══════════════════════════════
+
+/// Serialize a [`MisaFile`] to URDF XML.
+///
+/// The inverse of [`import_str`], used by hosts whose master model is
+/// the `.misa` schema: links (inertial / visual / collision), named +
+/// inline materials, joints with `<limit>` / `<dynamics>` and `<mimic>`
+/// entries all round-trip. Mesh `file` references are emitted verbatim
+/// — the host applies its path policy (`package://` form, absolute,
+/// or relative-with-copy) before calling this.
+///
+/// Schema entities URDF cannot express (sensors, loop closures,
+/// collision pairs, actuators, poses) are omitted; the `.misa` master
+/// keeps them. Capsules are decomposed into a cylinder + two end-cap
+/// spheres (URDF has no standard capsule element).
+pub fn export(file: &MisaFile) -> String {
+    use crate::util::{fmt, origin_rotation, resolve_visual_rgba};
+    use std::collections::HashMap;
+
+    let materials: HashMap<&str, [f32; 4]> = file
+        .material
+        .iter()
+        .map(|m| (m.name.as_str(), crate::util::color_spec_to_rgba(&m.color)))
+        .collect();
+
+    let write_origin = |s: &mut String, o: &mn::Origin, indent: usize| {
+        if o.is_identity() {
+            return;
+        }
+        let (r, p, y) = origin_rotation(o).euler_angles();
+        let pad = " ".repeat(indent);
+        s.push_str(&format!(
+            "{pad}<origin xyz=\"{} {} {}\" rpy=\"{} {} {}\"/>\n",
+            fmt(o.xyz[0]),
+            fmt(o.xyz[1]),
+            fmt(o.xyz[2]),
+            fmt(r),
+            fmt(p),
+            fmt(y),
+        ));
+    };
+
+    let write_geometry = |s: &mut String, g: &mn::Geom, indent: usize| {
+        let pad = " ".repeat(indent);
+        s.push_str(&format!("{pad}<geometry>\n"));
+        match g {
+            mn::Geom::Box { size } => {
+                s.push_str(&format!(
+                    "{pad}  <box size=\"{} {} {}\"/>\n",
+                    fmt(size[0]),
+                    fmt(size[1]),
+                    fmt(size[2]),
+                ));
+            }
+            mn::Geom::Cylinder { radius, length } => {
+                s.push_str(&format!(
+                    "{pad}  <cylinder radius=\"{}\" length=\"{}\"/>\n",
+                    fmt(*radius),
+                    fmt(*length),
+                ));
+            }
+            mn::Geom::Sphere { radius } => {
+                s.push_str(&format!("{pad}  <sphere radius=\"{}\"/>\n", fmt(*radius)));
+            }
+            mn::Geom::Capsule { radius, length } => {
+                s.push_str(&format!(
+                    "{pad}  <capsule radius=\"{}\" length=\"{}\"/>\n",
+                    fmt(*radius),
+                    fmt(*length),
+                ));
+            }
+            mn::Geom::Mesh { file, scale } => {
+                let unit = scale == &[1.0, 1.0, 1.0];
+                if unit {
+                    s.push_str(&format!(
+                        "{pad}  <mesh filename=\"{}\"/>\n",
+                        xml_escape(file),
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "{pad}  <mesh filename=\"{}\" scale=\"{} {} {}\"/>\n",
+                        xml_escape(file),
+                        fmt(scale[0]),
+                        fmt(scale[1]),
+                        fmt(scale[2]),
+                    ));
+                }
+            }
+        }
+        s.push_str(&format!("{pad}</geometry>\n"));
+    };
+
+    // URDF has no native capsule element: split into a cylinder plus
+    // two end-cap spheres (offset ±length/2 along the capsule's local
+    // Z, rotation preserved) so the emitted file stays standard.
+    let cap_origin = |o: &mn::Origin, dz: f64| -> mn::Origin {
+        let iso = crate::util::origin_iso(o);
+        let p = iso * nalgebra::Point3::new(0.0, 0.0, dz);
+        mn::Origin {
+            xyz: [p.x, p.y, p.z],
+            rpy: o.rpy,
+            quat: o.quat,
+        }
+    };
+    let capsule_parts = |o: &mn::Origin, radius: f64, length: f64| {
+        vec![
+            (o.clone(), mn::Geom::Cylinder { radius, length }),
+            (cap_origin(o, length / 2.0), mn::Geom::Sphere { radius }),
+            (cap_origin(o, -length / 2.0), mn::Geom::Sphere { radius }),
+        ]
+    };
+    let split_capsule = |o: &mn::Origin, g: &mn::Geom| -> Vec<(mn::Origin, mn::Geom)> {
+        match g {
+            mn::Geom::Capsule { radius, length } => capsule_parts(o, *radius, *length),
+            other => vec![(o.clone(), other.clone())],
+        }
+    };
+
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\"?>\n");
+    s.push_str(&format!("<robot name=\"{}\">\n", xml_escape(&file.robot.name)));
+
+    // ── Named materials ─────────────────────────────────────────────────
+    for m in &file.material {
+        let c = crate::util::color_spec_to_rgba(&m.color);
+        s.push_str(&format!(
+            "  <material name=\"{}\">\n    <color rgba=\"{} {} {} {}\"/>\n  </material>\n",
+            xml_escape(&m.name),
+            c[0], c[1], c[2], c[3],
+        ));
+    }
+
+    // ── Links ───────────────────────────────────────────────────────────
+    for link in &file.link {
+        s.push_str(&format!("  <link name=\"{}\">\n", xml_escape(&link.name)));
+
+        let i = &link.inertial;
+        let has_inertial = i.mass != 0.0
+            || i.ixx != 0.0
+            || i.iyy != 0.0
+            || i.izz != 0.0
+            || i.ixy != 0.0
+            || i.ixz != 0.0
+            || i.iyz != 0.0
+            || !i.origin.is_identity();
+        if has_inertial {
+            s.push_str("    <inertial>\n");
+            write_origin(&mut s, &i.origin, 6);
+            s.push_str(&format!("      <mass value=\"{}\"/>\n", fmt(i.mass)));
+            s.push_str(&format!(
+                "      <inertia ixx=\"{}\" ixy=\"{}\" ixz=\"{}\" iyy=\"{}\" iyz=\"{}\" izz=\"{}\"/>\n",
+                fmt(i.ixx),
+                fmt(i.ixy),
+                fmt(i.ixz),
+                fmt(i.iyy),
+                fmt(i.iyz),
+                fmt(i.izz),
+            ));
+            s.push_str("    </inertial>\n");
+        }
+
+        for vis in &link.visual {
+            for (origin, geom) in split_capsule(&vis.origin, &vis.geom) {
+            s.push_str("    <visual>\n");
+            write_origin(&mut s, &origin, 6);
+            write_geometry(&mut s, &geom, 6);
+            if let Some(name) = &vis.material {
+                // Reference to a robot-level material (colour lives there).
+                s.push_str(&format!(
+                    "      <material name=\"{}\"/>\n",
+                    xml_escape(name),
+                ));
+            } else if vis.color.is_some() {
+                let c = resolve_visual_rgba(vis, &materials);
+                s.push_str(&format!(
+                    "      <material name=\"\">\n        <color rgba=\"{} {} {} {}\"/>\n      </material>\n",
+                    c[0], c[1], c[2], c[3],
+                ));
+            }
+            s.push_str("    </visual>\n");
+            }
+        }
+
+        for col in &link.collision {
+            for (origin, geom) in split_capsule(&col.origin, &col.geom) {
+                s.push_str("    <collision>\n");
+                write_origin(&mut s, &origin, 6);
+                write_geometry(&mut s, &geom, 6);
+                s.push_str("    </collision>\n");
+            }
+        }
+
+        s.push_str("  </link>\n");
+    }
+
+    // ── Joints ──────────────────────────────────────────────────────────
+    for joint in &file.joint {
+        let jtype = match joint.kind {
+            mn::JointKind::Revolute => "revolute",
+            mn::JointKind::Continuous => "continuous",
+            mn::JointKind::Prismatic => "prismatic",
+            mn::JointKind::Fixed => "fixed",
+            mn::JointKind::Floating => "floating",
+            mn::JointKind::Planar => "planar",
+        };
+        s.push_str(&format!(
+            "  <joint name=\"{}\" type=\"{jtype}\">\n",
+            xml_escape(&joint.name),
+        ));
+        s.push_str(&format!(
+            "    <parent link=\"{}\"/>\n",
+            xml_escape(&joint.parent),
+        ));
+        s.push_str(&format!(
+            "    <child link=\"{}\"/>\n",
+            xml_escape(&joint.child),
+        ));
+        write_origin(&mut s, &joint.origin, 4);
+
+        let needs_axis = matches!(
+            joint.kind,
+            mn::JointKind::Revolute
+                | mn::JointKind::Continuous
+                | mn::JointKind::Prismatic
+                | mn::JointKind::Planar
+        );
+        if needs_axis {
+            s.push_str(&format!(
+                "    <axis xyz=\"{} {} {}\"/>\n",
+                fmt(joint.axis[0]),
+                fmt(joint.axis[1]),
+                fmt(joint.axis[2]),
+            ));
+        }
+
+        // URDF requires <limit> on revolute / prismatic; continuous
+        // carries effort / velocity bounds only when declared.
+        let l = &joint.limit;
+        match joint.kind {
+            mn::JointKind::Revolute | mn::JointKind::Prismatic => {
+                s.push_str(&format!(
+                    "    <limit lower=\"{}\" upper=\"{}\" effort=\"{}\" velocity=\"{}\"/>\n",
+                    fmt(l.lower),
+                    fmt(l.upper),
+                    fmt(l.effort),
+                    fmt(l.velocity),
+                ));
+            }
+            mn::JointKind::Continuous if l.effort != 0.0 || l.velocity != 0.0 => {
+                s.push_str(&format!(
+                    "    <limit effort=\"{}\" velocity=\"{}\"/>\n",
+                    fmt(l.effort),
+                    fmt(l.velocity),
+                ));
+            }
+            _ => {}
+        }
+
+        let d = &joint.dynamics;
+        if d.damping != 0.0 || d.friction != 0.0 {
+            s.push_str(&format!(
+                "    <dynamics damping=\"{}\" friction=\"{}\"/>\n",
+                fmt(d.damping),
+                fmt(d.friction),
+            ));
+        }
+
+        if let Some(m) = file.mimic.iter().find(|m| m.joint == joint.name) {
+            s.push_str(&format!(
+                "    <mimic joint=\"{}\" multiplier=\"{}\" offset=\"{}\"/>\n",
+                xml_escape(&m.source),
+                fmt(m.multiplier),
+                fmt(m.offset),
+            ));
+        }
+
+        s.push_str("  </joint>\n");
+    }
+
+    s.push_str("</robot>\n");
+    s
+}
+
 // ─── Writer ─────────────────────────────────────────────────────────────────
 
 /// Write a `Model<f64>` to a URDF XML file on disk.
@@ -1155,5 +1439,103 @@ mod tests {
         assert_relative_eq!(ri[(0, 0)], 1.0, epsilon = 1e-9);
         assert_relative_eq!(ri[(1, 1)], 3.0, epsilon = 1e-9);
         assert_relative_eq!(ri[(2, 2)], 2.0, epsilon = 1e-9);
+    }
+    // ─── MisaFile export ────────────────────────────────────────────────
+
+    #[test]
+    fn export_round_trips_via_import() {
+        let import = import_str(URDF_WITH_GEOMETRY).unwrap();
+        let xml = export(&import.file);
+        assert!(xml.contains("<robot name=\"geom_test\">"));
+        let back = import_str(&xml).unwrap();
+        assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+        assert_eq!(back.file.link.len(), import.file.link.len());
+        assert_eq!(back.file.joint.len(), import.file.joint.len());
+        assert_eq!(back.file.robot.root, import.file.robot.root);
+        // FK parity through the whole cycle.
+        let m1 = load_urdf_string(URDF_WITH_GEOMETRY).unwrap();
+        let m2 = load_urdf_string(&xml).unwrap();
+        assert!(m1.approx_eq(&m2, 1e-9));
+    }
+
+    #[test]
+    fn export_emits_limits_dynamics_mimic_and_materials() {
+        let xml = r#"<robot name="rich">
+  <material name="red"><color rgba="1 0 0 1"/></material>
+  <link name="base">
+    <visual>
+      <geometry><box size="0.1 0.1 0.1"/></geometry>
+      <material name="red"/>
+    </visual>
+  </link>
+  <link name="a"/><link name="b"/>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="a"/><axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="30" velocity="10"/>
+    <dynamics damping="0.2" friction="0.05"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="base"/><child link="b"/><axis xyz="0 1 0"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+    <mimic joint="j1" multiplier="0.5" offset="0.1"/>
+  </joint>
+</robot>"#;
+        let import = import_str(xml).unwrap();
+        let out = export(&import.file);
+        assert!(out.contains("<material name=\"red\">"));
+        assert!(out.contains("<color rgba=\"1 0 0 1\"/>"));
+        assert!(out.contains("<limit lower=\"-1.5\" upper=\"1.5\" effort=\"30\" velocity=\"10\"/>"));
+        assert!(out.contains("<dynamics damping=\"0.2\" friction=\"0.05\"/>"));
+        assert!(out.contains("<mimic joint=\"j1\" multiplier=\"0.5\" offset=\"0.1\"/>"));
+
+        // Everything survives a second import.
+        let back = import_str(&out).unwrap();
+        let j1 = &back.file.joint[0];
+        assert_eq!((j1.limit.lower, j1.limit.upper), (-1.5, 1.5));
+        assert_eq!((j1.dynamics.damping, j1.dynamics.friction), (0.2, 0.05));
+        assert_eq!(back.file.mimic.len(), 1);
+        assert_eq!(back.file.link[0].visual[0].material.as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn export_keeps_mesh_reference_verbatim() {
+        let xml = r#"<robot name="m">
+  <link name="base">
+    <visual>
+      <geometry><mesh filename="package://robot/meshes/base.stl" scale="0.001 0.001 0.001"/></geometry>
+    </visual>
+  </link>
+</robot>"#;
+        let out = export(&import_str(xml).unwrap().file);
+        assert!(out.contains("<mesh filename=\"package://robot/meshes/base.stl\" scale=\"0.001 0.001 0.001\"/>"));
+    }
+
+    #[test]
+    fn export_continuous_has_no_positional_limit() {
+        let xml = r#"<robot name="c">
+  <link name="a"/><link name="w"/>
+  <joint name="wheel" type="continuous">
+    <parent link="a"/><child link="w"/><axis xyz="0 0 1"/>
+  </joint>
+</robot>"#;
+        let out = export(&import_str(xml).unwrap().file);
+        assert!(!out.contains("<limit"), "{out}");
+        assert!(out.contains("type=\"continuous\""));
+    }
+    #[test]
+    fn export_decomposes_capsule() {
+        let xml = r#"<robot name="cap">
+  <link name="a">
+    <visual><geometry><capsule radius="0.05" length="0.4"/></geometry></visual>
+    <collision><geometry><capsule radius="0.05" length="0.4"/></geometry></collision>
+  </link>
+</robot>"#;
+        let out = export(&import_str(xml).unwrap().file);
+        assert!(!out.contains("<capsule"), "{out}");
+        assert_eq!(out.matches("<cylinder").count(), 2);
+        assert_eq!(out.matches("<sphere").count(), 4);
+        // End caps sit at ±length/2 on the local Z axis.
+        assert!(out.contains("xyz=\"0 0 0.2\""));
+        assert!(out.contains("xyz=\"0 0 -0.2\""));
     }
 }
