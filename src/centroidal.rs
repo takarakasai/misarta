@@ -135,6 +135,32 @@ pub fn compute_com_velocity(model: &Model<f64>, q: &[f64], v: &[f64]) -> Vector3
     (j * v_vec).fixed_rows::<3>(0).into()
 }
 
+/// The CoM Jacobian bias term `J̇_com·v` (a 3-vector) — the CoM
+/// acceleration from the current motion when `q̈ = 0`, i.e. the drift in
+/// `p̈_com = J_com·q̈ + J̇_com·v`. The CoM counterpart of
+/// [`crate::jacobian::compute_jacobian_dot_times_v`], for an
+/// acceleration-level CoM task (e.g. `misa-wbc`'s `cartesian_
+/// acceleration` on the centre of mass).
+///
+/// Central finite difference of `J_com(q)·v` along the `v` direction
+/// under the manifold retraction (`eps = 1e-6`, matching the link
+/// Jacobian-derivative helper).
+pub fn compute_com_jacobian_dot_times_v(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+) -> Vector3<f64> {
+    assert_eq!(q.len(), model.nq);
+    assert_eq!(v.len(), model.nv);
+    let eps = 1e-6;
+    let v_vec = DVector::from_column_slice(v);
+    let q_plus = crate::manifold::integrate(model, q, v, eps);
+    let q_minus = crate::manifold::integrate(model, q, v, -eps);
+    let jv_plus = compute_com_jacobian(model, &q_plus) * &v_vec;
+    let jv_minus = compute_com_jacobian(model, &q_minus) * &v_vec;
+    ((jv_plus - jv_minus) / (2.0 * eps)).fixed_rows::<3>(0).into()
+}
+
 /// Centroidal Momentum Matrix (CMM) A_G: a 6×nv matrix such that
 ///
 /// `h = [h_ang; h_lin] = A_G * v`
@@ -545,4 +571,24 @@ mod tests {
         assert_abs_diff_eq!(h_dot[4], h_dot_fd[4], epsilon = 1e-3);
         assert_abs_diff_eq!(h_dot[5], h_dot_fd[5], epsilon = 1e-3);
     }
+    #[test]
+    fn com_jacobian_dot_times_v_matches_finite_diff_of_com_vel() {
+        // J̇_com·v must equal the central finite difference of the CoM
+        // velocity J_com·v along the motion — the same definition the
+        // helper uses, cross-checked against compute_com_velocity.
+        let (model, _) = two_link_arm();
+        let q = vec![0.3, -0.6];
+        let v = vec![0.9, 0.2];
+        let eps = 1e-6;
+        let q_plus = crate::manifold::integrate(&model, &q, &v, eps);
+        let q_minus = crate::manifold::integrate(&model, &q, &v, -eps);
+        let ref_dv =
+            (compute_com_velocity(&model, &q_plus, &v) - compute_com_velocity(&model, &q_minus, &v))
+                / (2.0 * eps);
+        let direct = compute_com_jacobian_dot_times_v(&model, &q, &v);
+        for r in 0..3 {
+            approx::assert_relative_eq!(direct[r], ref_dv[r], epsilon = 1e-6);
+        }
+    }
+
 }

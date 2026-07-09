@@ -1,2 +1,5 @@
 target
 Cargo.lock
+
+# Local reference material (external repos cloned for study)
+/ref/

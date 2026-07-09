@@ -369,6 +369,42 @@ pub fn compute_joint_jacobian_time_derivative(
     (&j_plus - &j_minus) / (2.0 * eps)
 }
 
+/// The Jacobian-time-derivative **bias term** `J̇·v` (a spatial
+/// 6-vector) for `joint_idx` — the acceleration a link picks up from
+/// the current motion when `q̈ = 0`, i.e. the drift term in the
+/// operational-space acceleration `a = J·q̈ + J̇·v`.
+///
+/// This is what an acceleration-level / inverse-dynamics whole-body
+/// controller needs (e.g. `misa-wbc`'s `cartesian_acceleration`), and
+/// it is the quantity to prefer over forming the full 6×nv
+/// [`compute_joint_jacobian_time_derivative`] and multiplying by `v`:
+/// here we central-difference the spatial velocity `J·v` directly along
+/// the `v` direction, so no 6×nv matrix is ever built.
+///
+/// Central finite difference of `J(q)·v` under the manifold retraction:
+/// `J̇·v = d/dt(J·v)` at constant `v` (which holds when `q̈ = 0`). The
+/// `eps = 1e-6` matches [`compute_joint_jacobian_time_derivative`]
+/// (a balance between truncation error and manifold-`exp`/`log` noise).
+pub fn compute_jacobian_dot_times_v(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+    joint_idx: usize,
+) -> nalgebra::Vector6<f64> {
+    assert_eq!(q.len(), model.nq);
+    assert_eq!(v.len(), model.nv);
+    assert!(joint_idx > 0 && joint_idx < model.joints.len());
+
+    let eps = 1e-6;
+    let v_vec = nalgebra::DVector::from_column_slice(v);
+    let q_plus = crate::manifold::integrate(model, q, v, eps);
+    let q_minus = crate::manifold::integrate(model, q, v, -eps);
+    let jv_plus = compute_joint_jacobian(model, &q_plus, joint_idx) * &v_vec;
+    let jv_minus = compute_joint_jacobian(model, &q_minus, joint_idx) * &v_vec;
+    let d = (jv_plus - jv_minus) / (2.0 * eps);
+    nalgebra::Vector6::from_column_slice(d.as_slice())
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -766,4 +802,31 @@ mod tests {
 
         assert_relative_eq!(dj, dj_fd, epsilon = 1e-4);
     }
+    #[test]
+    fn jacobian_dot_times_v_matches_matrix_times_v() {
+        // The dedicated J̇·v helper must equal forming the full J̇ and
+        // multiplying by v, for an arbitrary configuration and velocity.
+        let model = three_link_arm();
+        let q = vec![0.3, -0.7, 0.5];
+        let v = vec![1.1, -0.4, 0.9];
+        for joint_idx in 1..model.joints.len() {
+            let jdot = compute_joint_jacobian_time_derivative(&model, &q, &v, joint_idx);
+            let v_vec = nalgebra::DVector::from_column_slice(&v);
+            let reference = jdot * v_vec; // 6-vector
+            let direct = compute_jacobian_dot_times_v(&model, &q, &v, joint_idx);
+            for r in 0..6 {
+                assert_relative_eq!(direct[r], reference[r], epsilon = 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn jacobian_dot_times_v_zero_velocity_is_zero() {
+        let model = two_link_arm();
+        let q = vec![0.2, 0.4];
+        let v = vec![0.0, 0.0];
+        let d = compute_jacobian_dot_times_v(&model, &q, &v, 2);
+        assert!(d.norm() < 1e-9, "J̇·v must vanish at v = 0");
+    }
+
 }
