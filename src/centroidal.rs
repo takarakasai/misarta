@@ -341,6 +341,37 @@ pub fn compute_centroidal_momentum_matrix_time_derivative(
     da
 }
 
+/// The CMM bias term `Ȧ_G·v` (a spatial 6-vector) — the centroidal
+/// momentum rate from the current motion when `q̈ = 0`, i.e. the drift
+/// in `ḣ = A_G·q̈ + Ȧ_G·v`. The centroidal counterpart of
+/// [`crate::jacobian::compute_jacobian_dot_times_v`], for a
+/// momentum-rate task in an acceleration-level whole-body controller
+/// (e.g. misa-wbc's `centroidal_momentum`).
+///
+/// Prefer this over forming the full 6×nv
+/// [`compute_centroidal_momentum_matrix_time_derivative`] and
+/// multiplying by `v`: this is a single central difference of `A_G(q)·v`
+/// **along the motion direction** (2 CMM evaluations instead of 2·nv),
+/// and it perturbs `q` through the manifold retraction, so it is also
+/// correct for floating-base models (`nq ≠ nv`) where a direct
+/// per-coordinate `q ± ε` would leave the quaternion manifold.
+pub fn compute_cmm_dot_times_v(
+    model: &Model<f64>,
+    q: &[f64],
+    v: &[f64],
+) -> Vector6<f64> {
+    assert_eq!(q.len(), model.nq);
+    assert_eq!(v.len(), model.nv);
+    let eps = 1e-6;
+    let v_vec = DVector::from_column_slice(v);
+    let q_plus = crate::manifold::integrate(model, q, v, eps);
+    let q_minus = crate::manifold::integrate(model, q, v, -eps);
+    let hv_plus = compute_centroidal_momentum_matrix(model, &q_plus) * &v_vec;
+    let hv_minus = compute_centroidal_momentum_matrix(model, &q_minus) * &v_vec;
+    let d = (hv_plus - hv_minus) / (2.0 * eps);
+    Vector6::new(d[0], d[1], d[2], d[3], d[4], d[5])
+}
+
 /// Centroidal momentum rate: `ḣ = A_G q̈ + Ȧ_G q̇`.
 ///
 /// Computes the full time derivative of centroidal momentum given
@@ -571,6 +602,22 @@ mod tests {
         assert_abs_diff_eq!(h_dot[4], h_dot_fd[4], epsilon = 1e-3);
         assert_abs_diff_eq!(h_dot[5], h_dot_fd[5], epsilon = 1e-3);
     }
+    #[test]
+    fn cmm_dot_times_v_matches_full_matrix_path() {
+        // Fixed-base arm (nq == nv), where the per-coordinate full-matrix
+        // derivative is valid — the directional helper must agree with
+        // Ȧ_G·v from compute_centroidal_momentum_matrix_time_derivative.
+        let (model, _) = two_link_arm();
+        let q = vec![0.4, -0.9];
+        let v = vec![1.2, 0.7];
+        let dag = compute_centroidal_momentum_matrix_time_derivative(&model, &q, &v);
+        let reference = dag * DVector::from_column_slice(&v);
+        let direct = compute_cmm_dot_times_v(&model, &q, &v);
+        for r in 0..6 {
+            approx::assert_relative_eq!(direct[r], reference[r], epsilon = 1e-5);
+        }
+    }
+
     #[test]
     fn com_jacobian_dot_times_v_matches_finite_diff_of_com_vel() {
         // J̇_com·v must equal the central finite difference of the CoM
